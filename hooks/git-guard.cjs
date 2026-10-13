@@ -14,6 +14,7 @@
  *     can_push=true, the server would accept the push and it must still be refused
  *   - no push to any ref other than this run's leased branch
  *   - no deleting protected branches, local or remote
+ *   - no `git stash` other than `list`/`show` (work is set aside as a WIP commit)
  *   - no `git remote set-url` (repointing origin defeats every other rule)
  *   - no `gh` / `glab` CLI, which are unguarded paths to the same operations
  *   - no git command whose working directory is outside the leased worktree.
@@ -129,6 +130,27 @@ function checkBranchDelete(t, cfg) {
   }
 }
 
+/**
+ * `git stash` is banned in a leased worktree. A stash is state the conductor
+ * cannot see: in ticket #8878 a leftover stash/pop sequence reverted commits
+ * and the session blamed a concurrent process. Setting work aside is a WIP
+ * commit on the leased branch; reading the stash list stays allowed.
+ *
+ * Called when the loop's subcommand is `stash`, so the action is the token
+ * after it — which also catches `git -C <dir> stash`, where t[1] is `-C`.
+ */
+function checkStash(t) {
+  const sub = t[t.indexOf('stash') + 1] || 'push';
+  if (sub === 'list' || sub === 'show') return;
+  C.event('denied_stash', { cmd: t.join(' ') });
+  C.deny(
+    `Denied: \`git stash\` is not available in a leased worktree (${sub}).\n` +
+    'A stash is state nothing else can see, and a leftover one has silently reverted a ' +
+    'run\'s commits before. To set work aside, commit it as WIP on the leased branch ' +
+    '(`git commit -m "wip: …"`) and amend or squash later.',
+  );
+}
+
 function checkCwd(cmd) {
   const wt = leasedWorktree();
   if (!wt) return;
@@ -185,6 +207,7 @@ try {
 
       if (sub === 'push') checkPush(t, cfg);
       if (sub === 'branch') checkBranchDelete(t, cfg);
+      if (sub === 'stash') checkStash(t);
 
       if (sub === 'remote' && t.includes('set-url')) {
         C.event('denied_remote_seturl', { cmd: seg });

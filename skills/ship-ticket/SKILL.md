@@ -188,3 +188,8 @@ the machine is genuinely done, never as a courtesy.
   `--skip-worktree`; `app.cjs` re-applies and re-marks them after every checkout.
 - Do not push to `dev`, `stage`, `master` or `main`. Branch, then MR.
 - Do not write the design or plan into the repository; they belong in $ONESHOT_ARTIFACTS.
+- Do not `git stash` in the worktree (the guard denies it). Set work aside with a WIP commit
+  on your branch; a leftover stash once reverted a run's commits and looked like a race.
+- Do not rewrite a whole file to change a few lines. Use Edit; the guard denies a Write
+  that drops most of an existing file. After each edit, `git diff --stat` — deletions far
+  larger than intended mean restore the file and re-apply only the change you meant.
