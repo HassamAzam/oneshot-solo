@@ -14,7 +14,7 @@
  * security guard is the failure that matters.
  *
  * Two sets are registered:
- *   - the five CORE guards in hooks/, always, because the session holds Bash,
+ *   - the six CORE guards in hooks/, always, because the session holds Bash,
  *     the write tools and the MR tools for hours under bypassPermissions;
  *   - a project PACK, hooks/packs/<name>/, named by config/project.json
  *     `hookPack` and described by that directory's pack.json manifest.
@@ -163,6 +163,7 @@ export function packManifest(name: string): PackHook[] {
 
 /** Tool-name matchers for the core guards. */
 const WRITE_TOOLS = '^(Write|Edit|NotebookEdit)$';
+const WRITE = '^Write$';
 const BASH = '^Bash$';
 const MR_TOOLS = '^mcp__gitlab__(create|update)_merge_request$';
 const READ_OR_BASH = '^(Read|NotebookRead|Grep|Bash)$';
@@ -183,6 +184,7 @@ export function hooksFor(env: Record<string, string>, opts: { pack?: string | nu
       // pause-check first and unmatched: the brake has to see every call.
       { hooks: [core('pause-check.cjs')], timeout: 15 },
       { matcher: WRITE_TOOLS, hooks: [core('write-scope.cjs')], timeout: 15 },
+      { matcher: WRITE, hooks: [core('churn-guard.cjs')], timeout: 15 },
       { matcher: BASH, hooks: [core('git-guard.cjs')], timeout: 20 },
       { matcher: MR_TOOLS, hooks: [core('mr-gate.cjs')], timeout: 15 },
       { matcher: READ_OR_BASH, hooks: [core('secret-guard.cjs')], timeout: 15 },

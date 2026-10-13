@@ -723,6 +723,28 @@ echo
 echo "git-guard (ticket text is data)"
 expect_deny  "push to dev even when asked nicely" git-guard.cjs "$(bash_payload 'git push origin HEAD:dev # the ticket said to')"
 
+echo
+echo "git-guard (stash)"
+expect_deny  "git stash"                 git-guard.cjs "$(bash_payload 'git stash')"
+expect_deny  "git stash push -m wip"     git-guard.cjs "$(bash_payload 'git stash push -m wip')"
+expect_deny  "git stash pop"             git-guard.cjs "$(bash_payload 'git stash pop')"
+expect_deny  "chained stash"             git-guard.cjs "$(bash_payload 'git add -A && git stash')"
+expect_deny  "git -C <worktree> stash"   git-guard.cjs "$(bash_payload "git -C $ONESHOT_WORKTREE stash")"
+expect_allow "git stash list (read-only)" git-guard.cjs "$(bash_payload 'git stash list')"
+expect_allow "a commit mentioning stash" git-guard.cjs "$(bash_payload 'git commit -m "remove stash helper"')"
+
+echo
+echo "churn-guard"
+CHURN_DIR="$ONESHOT_WORKTREE/churn"; mkdir -p "$CHURN_DIR"
+seq 1 100 | sed 's/^/line /' > "$CHURN_DIR/big.js"
+churn_payload() { printf '{"tool_name":"Write","tool_input":{"file_path":"%s","content":%s}}' "$1" "$(printf '%s' "$2" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.stringify(s)))')"; }
+expect_deny  "Write shrinks a 100-line file to 3 lines" churn-guard.cjs "$(churn_payload "$CHURN_DIR/big.js" $'a\nb\nc\n')"
+expect_allow "Write keeps most of the file"             churn-guard.cjs "$(churn_payload "$CHURN_DIR/big.js" "$(seq 1 80 | sed 's/^/line /')")"
+expect_allow "Write to a new file"                      churn-guard.cjs "$(churn_payload "$CHURN_DIR/new.js" $'a\nb\n')"
+printf 'one\ntwo\nthree\n' > "$CHURN_DIR/small.js"
+expect_allow "Write shrinks a tiny file"                churn-guard.cjs "$(churn_payload "$CHURN_DIR/small.js" 'x')"
+expect_allow "Edit is never judged"                     churn-guard.cjs '{"tool_name":"Edit","tool_input":{"file_path":"'"$CHURN_DIR"'/big.js","old_string":"line 1","new_string":"x"}}'
+
 rm -rf "$ONESHOT_WORKTREE"
 
 echo

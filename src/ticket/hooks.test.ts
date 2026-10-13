@@ -15,10 +15,11 @@ test('guardEnv forwards only PATH, HOME, CONTEXT_REPO and ONESHOT_*', () => {
   assert.deepEqual(Object.keys(env).sort(), ['CONTEXT_REPO', 'HOME', 'ONESHOT_PHASE', 'PATH']);
 });
 
-test('hooksFor registers the five core guards and the erp pack from its manifest', () => {
+test('hooksFor registers the six core guards and the erp pack from its manifest', () => {
   const h = hooksFor({ ONESHOT_PHASE: 'ticket' }) as Record<string, Array<{ matcher?: string; hooks: unknown[]; timeout: number }>>;
   const pre = h.PreToolUse!.map((m) => m.matcher ?? '*');
   assert.ok(pre.includes('^Bash$'));                                   // git-guard
+  assert.ok(pre.includes('^Write$'));                                  // churn-guard
   assert.ok(pre.includes('^mcp__gitlab__(create|update)_merge_request$'));
   assert.equal(h.PreToolUse![0]!.matcher, undefined);                  // pause-check first, unmatched
   assert.ok(h.PostToolUse!.some((m) => m.timeout === 60));             // py-lint from the pack
