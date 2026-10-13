@@ -48,8 +48,8 @@ function spawnApp(args: string[], logName: string, env: Record<string, string>):
       cwd: ROOT, detached: true, stdio: ['ignore', out, out], env: { ...process.env, ...env },
     });
     // The child holds its own dup of this fd for stdout/stderr; the parent's copy is done
-    // the moment spawn returns. A long-lived conductor calls this on every warm/startRun,
-    // so not closing it here leaks one fd per bring-up.
+    // the moment spawn returns. A long-lived conductor calls this on every run, so not
+    // closing it here leaks one fd per bring-up.
     closeSync(out);
     child.unref();
     return child.pid ?? null;
@@ -57,21 +57,6 @@ function spawnApp(args: string[], logName: string, env: Record<string, string>):
     log.warn('app       could not start the bring-up', { error: (err as Error).message });
     return null;
   }
-}
-
-/**
- * One warm app for this loop, at boot, in its own worktree.
- *
- * The instance itself is almost beside the point. Every worktree on this machine
- * symlinks the seed repo's `node_modules`, so they share one babel cache — and keeping
- * a compile warm in it is the difference between a two-minute first build in the next
- * worktree and a twenty-minute one. A second conductor gets its own instance rather
- * than sharing this one, because a shared instance is a port its owner is about to want.
- */
-export function warmLoopApp(conductor: string): void {
-  if (DRY_RUN) return;
-  const pid = spawnApp(['warm', '--owner', conductor], 'warm.log', { ONESHOT_CONDUCTOR: conductor });
-  if (pid) log.ok(`app        warming one instance for this loop (pid ${pid}; state/apps/warm.log)`);
 }
 
 /**
@@ -87,9 +72,6 @@ export function startRunApp(opts: {
   iid: number; runId: string; worktree: string; port: number;
 }): number | null {
   if (DRY_RUN) return null;
-  // No --owner: ownership is a WARM-POOL concept, and stamping a run id on an instance
-  // is how a run came to take a loop's warm app away from it — after which the next
-  // `warm` no longer recognised its own instance and built a third one.
   const pid = spawnApp(
     ['ensure', '--worktree', opts.worktree, '--port', String(opts.port)],
     `run-${opts.iid}.log`,
