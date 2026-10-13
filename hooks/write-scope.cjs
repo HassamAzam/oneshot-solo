@@ -15,7 +15,7 @@
  *      SKILL.md as "inside the worktree" while the write lands in context/ —
  *      letting an implement phase rewrite the skills that govern it,
  *      permanently, for every future run and every interactive session.
- *      C.isInside() realpath-resolves before comparing. See docs/HOOKS.md 4.1.
+ *      C.isInside() realpath-resolves before comparing. See docs/HOOKS.md §3.
  *
  *   2. The context repo (~/Documents/erp). It is read-only reference — Oneshot
  *      reads it for prior art and conventions and never writes to it. (Skills

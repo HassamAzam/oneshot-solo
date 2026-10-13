@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * SessionStart: put the test-case traps list in front of `testcases` before it
- * writes a single case.
+ * SessionStart: put the test-case traps list in front of the ticket session
+ * before it writes a single case.
  *
  * WHY A HOOK AND NOT A PROMPT LINE. `erp-ticket-test-plan` already says to read
  * `refs/traps.md`, and an instruction to read a file is a request, not a
  * guarantee: the phase has died at its turn cap before now, and the first thing
  * a session under budget pressure drops is a read whose value it cannot see
- * yet. Injecting the content costs the phase ZERO turns and cannot be skipped,
+ * yet. Injecting the content costs the session ZERO turns and cannot be skipped,
  * which is the whole difference between "should consult" and "has consulted".
  *
  * It also lands earlier than a read ever could. The traps are about how a case
@@ -17,9 +17,10 @@
  * Read after twenty cases are drafted, that list is a rewrite. Read before the
  * first one, it is just how the cases come out.
  *
- * SCOPE. `testcases` only. Every other phase exits before reading anything:
- * `verify` executes a list it did not write, and `implement` does not need a
- * QA checklist competing with its own standards for attention.
+ * SCOPE. Every ticket session. There used to be a `testcases` phase gate here;
+ * Solo runs one session per ticket (ONESHOT_PHASE is always `ticket`), and that
+ * session writes the cases itself, so the gate would only ever have silenced
+ * the brief.
  *
  * FAILS OPEN, loudly. A missing or unreadable traps file must never wedge the
  * phase — the prompt still carries the method, and a list authored without the
@@ -30,11 +31,10 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
-const C = require(path.join(__dirname, '_common.cjs'));
+const C = require(path.join(__dirname, '..', '..', '_common.cjs'));
 
 C.bailIfNotOneshot();
 
-const PHASE = 'testcases';
 const SKILL = 'erp-ticket-test-plan';
 
 /**
@@ -53,7 +53,7 @@ const MAX_INLINE_BYTES = 24_000;
  * hooks stay dependency-free: they must run before `npm install` and must not
  * be breakable by a bad node_modules.
  */
-const REPO = path.join(__dirname, '..');
+const REPO = path.join(__dirname, '..', '..', '..');
 
 function trapsPath() {
   // Off `__dirname`, NOT `ONESHOT_HOME`: under a dry run the latter is
@@ -79,8 +79,6 @@ function inject(context) {
   C.emit({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } });
   process.exit(0);
 }
-
-if (C.phase() !== PHASE) C.allow();
 
 const file = trapsPath();
 let traps = '';
