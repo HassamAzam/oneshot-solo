@@ -6,7 +6,7 @@ import { createServer } from 'node:http';
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifySessionEnd, sessionEnv, queryOptions, sessionMcpServers } from './session.js';
+import { classifySessionEnd, foldFrame, newFrameFold, shouldPark, sessionEnv, queryOptions, sessionMcpServers, NO_STRUCTURED_OUTPUT } from './session.js';
 
 process.env.ONESHOT_GITLAB_TOKEN = 'glpat-test';   // resolveToken() stops here: no desk file, no keychain lookup
 
@@ -23,6 +23,66 @@ test('classifySessionEnd: success→ok, error_max_turns→failed, stalled/timeou
   assert.equal(classifySessionEnd({ ...base, error: 'Claude Code process exited with signal SIGKILL' }), 'infra');
   assert.equal(classifySessionEnd({ ...base, subtype: 'success', stderrTail: '[ACTION REQUIRED] accept the terms' }), 'ok'); // a finished session is not gated
   assert.equal(classifySessionEnd({ ...base, subtype: 'error_during_execution', stderrTail: '[ACTION REQUIRED] accept the terms' }), 'infra');
+});
+
+// ------------------------------------------------------------- the frame fold
+
+const SID = '5f0c2a8e-0000-4000-8000-000000000001';
+const init = { type: 'system', subtype: 'init', session_id: SID };
+const say = (text: string, extra: Record<string, unknown> = {}) => ({ type: 'assistant', session_id: SID, parent_tool_use_id: null, message: { content: [{ type: 'text', text }] }, ...extra });
+
+test('foldFrame: the session id is taken from the first frame that carries one, with no result frame at all', () => {
+  const f = newFrameFold();
+  // A session that stalled (or was cancelled, or parked) mid-work: frames, then nothing.
+  for (const msg of [init, say('reading the ticket'), say('writing the plan')]) assert.equal(foldFrame(f, msg as never), 'continue');
+  assert.equal(f.out.sessionId, SID);
+  assert.equal(f.settled, false);
+  assert.equal(f.out.resultSubtype, undefined);
+  assert.equal(f.turns, 2);
+  assert.equal(f.out.sawActivity, 3);
+});
+
+test('foldFrame: the first result frame settles and its session id stands; a trailing one is ignored', () => {
+  const f = newFrameFold();
+  foldFrame(f, init as never);
+  foldFrame(f, { type: 'result', subtype: 'success', session_id: 'from-result', num_turns: 9, structured_output: { summary: 's' }, result: '' } as never);
+  foldFrame(f, { type: 'result', subtype: 'error_during_execution', session_id: 'late', num_turns: 0, errors: ['x'] } as never);
+  assert.equal(f.out.sessionId, 'from-result');
+  assert.equal(f.out.turns, 9);
+  assert.equal(f.out.resultSubtype, 'success');
+  assert.deepEqual(f.out.result, { summary: 's' });
+});
+
+test('model prose that reads like a reset time neither stops the session nor parks the conductor', () => {
+  const f = newFrameFold();
+  foldFrame(f, init as never);
+  assert.equal(foldFrame(f, say('The leave balance resets at 12 am on 1 January, so the accrual job runs then.') as never), 'continue');
+  assert.equal(foldFrame(f, say('Users who hit the session limit see a toast.') as never), 'continue');
+  // A success without structured output: its prose is not a quota signal either.
+  foldFrame(f, { type: 'result', subtype: 'success', session_id: SID, num_turns: 3, result: 'Done — the balance resets at 12 am.' } as never);
+  assert.equal(f.out.error, NO_STRUCTURED_OUTPUT);
+  assert.equal(f.rateLimited, false);
+  assert.deepEqual(f.limitSignals, []);
+  assert.equal(shouldPark(f), false);
+});
+
+test('a frame the CLI tags error: rate_limit stops the session and parks; other error tags only when they read as a limit', () => {
+  const f = newFrameFold();
+  foldFrame(f, init as never);
+  assert.equal(foldFrame(f, say("You've hit your limit · resets 4:30pm", { error: 'rate_limit' }) as never), 'stop');
+  assert.equal(f.rateLimited, true);
+  assert.match(f.out.error!, /^rate_limit: /);
+  assert.equal(f.out.sessionId, SID, 'a parked session keeps its id for the resume');
+  assert.equal(shouldPark(f), true);
+
+  const g = newFrameFold();
+  assert.equal(foldFrame(g, say('Output was cut off', { error: 'max_output_tokens' }) as never), 'continue');
+  assert.equal(foldFrame(g, say('Usage limit reached · resets 9pm', { error: 'unknown' }) as never), 'stop');
+
+  // The prose matcher still reads result errors.
+  const h = newFrameFold();
+  foldFrame(h, { type: 'result', subtype: 'error_during_execution', session_id: SID, num_turns: 1, errors: ["You've hit your usage limit"] } as never);
+  assert.equal(shouldPark(h), true);
 });
 
 test('sessionEnv carries the identity, write scopes, artifacts and labels, and never a token or API key', () => {

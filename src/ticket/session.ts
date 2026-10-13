@@ -6,7 +6,8 @@
  * session honest: the hard deadline, the idle-stream watchdog, the
  * force-settle after any abort, the first-result-frame-settles rule, the
  * rate-limit short-circuit that parks for quota, and the `[ACTION REQUIRED]`
- * check on the CLI's stderr. Every SDK frame is teed to
+ * check on the CLI's stderr. What each frame means is a pure fold
+ * (foldFrame), so those rules are unit-tested on real frame shapes. Every SDK frame is teed to
  * state/runs/<iid>/transcripts/ticket-lap<n>.jsonl with a timestamp.
  *
  * Structured output is enforced by the SDK (`outputFormat: json_schema`), not
@@ -16,7 +17,7 @@
  * This module records nothing in run.json — run.ts calls recordPhase with what
  * this returns.
  */
-import { query, type McpStdioServerConfig, type Options } from '@anthropic-ai/claude-agent-sdk';
+import { query, type McpStdioServerConfig, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
@@ -257,6 +258,106 @@ export function classifySessionEnd(x: {
   return 'failed';
 }
 
+/** What the consume loop folds every SDK frame into. */
+export interface FrameFold {
+  out: SessionOutput;
+  /** The first result frame settles the attempt; any later one is ignored. */
+  settled: boolean;
+  /** Assistant frames so far: `num_turns` arrives only in the result frame. */
+  turns: number;
+  /**
+   * Text that may name a subscription limit: the CLI's error-tagged frames and
+   * a result frame's `errors[]` (runSession adds a thrown error). Never model
+   * prose — a session on an HR app writes "resets at 12 am" about leave
+   * balances, and one such sentence would abort it and park the conductor.
+   */
+  limitSignals: string[];
+  /** The CLI reported the subscription cap mid-stream: stop pulling and park. */
+  rateLimited: boolean;
+}
+
+export function newFrameFold(): FrameFold {
+  return {
+    out: { status: 'failed', result: null, turns: 0, sawActivity: 0, stderrTail: '' },
+    settled: false, turns: 0, limitSignals: [], rateLimited: false,
+  };
+}
+
+/**
+ * Fold one SDK frame into the attempt. Returns 'stop' when the frame is the
+ * subscription cap and the session must be withdrawn.
+ *
+ * The session id is recorded from the FIRST frame that carries one — every
+ * SDKMessage does — and not only from the result frame: an attempt that ends
+ * without one (stalled, timed out, Ctrl-C, parked for quota) is exactly the
+ * attempt whose conversation the retry and the next boot resume. The result
+ * frame's id is still the one that stands when there is a result frame.
+ */
+export function foldFrame(f: FrameFold, msg: SDKMessage, iid = 0): 'continue' | 'stop' {
+  f.out.sawActivity += 1;
+  const sid = (msg as { session_id?: unknown }).session_id;
+  if (!f.out.sessionId && typeof sid === 'string' && sid) f.out.sessionId = sid;
+
+  if (msg.type === 'assistant') {
+    f.turns += 1;
+    // A subscription cap arrives as synthetic assistant frames the CLI tags
+    // `error: "rate_limit"` ("You've hit your limit · resets 4:30pm"). Read as
+    // ordinary turns they burn the whole maxTurns cap before settling as
+    // error_max_turns, hiding the real cause. Only a tagged frame is read: an
+    // untagged one is the model talking. Another tag (`unknown`, say) parks
+    // only when its text reads as a limit — `max_output_tokens` or
+    // `overloaded` is the CLI recovering, not the account.
+    const errTag = typeof msg.error === 'string' ? msg.error : '';
+    if (errTag && !f.settled) {
+      const content = (msg.message as { content?: Array<{ text?: string }> } | undefined)?.content ?? [];
+      const texts = content.map((c) => c.text ?? '').join(' ');
+      if (errTag === 'rate_limit' || looksLikeUsageLimit(texts)) {
+        f.limitSignals.push(errTag, texts);
+        f.rateLimited = true;
+        f.out.error = `rate_limit: ${texts.slice(0, 200) || errTag}`;
+        return 'stop';
+      }
+    }
+    return 'continue';
+  }
+
+  if (msg.type === 'result') {
+    // The FIRST result frame settles the session, and only the first.
+    // Observed live: a 'success' frame carrying the real turns and usage,
+    // then an 'error_during_execution' frame carrying zero of each. Read as
+    // the outcome, the trailing frame failed a passing session and pushed
+    // its text into limitSignals, where one limit-shaped string parks the
+    // conductor on an account that was never limited.
+    if (f.settled) {
+      log.warn(`ticket #${iid}: extra result frame ignored`, { subtype: msg.subtype });
+      return 'continue';
+    }
+    f.settled = true;
+    f.out.turns = msg.num_turns;
+    f.out.sessionId = msg.session_id;
+    f.out.durationMs = msg.duration_ms;
+    f.out.apiDurationMs = msg.duration_api_ms;
+    f.out.costUsd = msg.total_cost_usd;
+    f.out.modelUsage = msg.modelUsage;
+    f.out.resultSubtype = msg.subtype;
+    if (msg.subtype === 'success') {
+      // A success without its structured output is a failed session, but its
+      // prose is the model's, so it is not a quota signal.
+      f.out.result = parseTicketResult(msg.structured_output);
+      if (!f.out.result) f.out.error = NO_STRUCTURED_OUTPUT;
+    } else {
+      f.out.error = `${msg.subtype}: ${(msg.errors ?? []).join('; ').slice(0, 300)}`;
+      f.limitSignals.push(...(msg.errors ?? []));
+    }
+  }
+  return 'continue';
+}
+
+/** The short-circuit parks on its own say-so; any other end parks only when what it collected reads as a limit. */
+export function shouldPark(f: FrameFold): boolean {
+  return f.rateLimited || looksLikeUsageLimit(f.limitSignals.join('\n'));
+}
+
 export async function runSession(input: SessionInput): Promise<SessionOutput> {
   const { iid, lap } = input;
   const caps = sessionCaps();
@@ -297,17 +398,13 @@ export async function runSession(input: SessionInput): Promise<SessionOutput> {
     else input.signal.addEventListener('abort', cancel, { once: true });
   }
 
-  const out: SessionOutput = { status: 'failed', result: null, turns: 0, sawActivity: 0, stderrTail: '' };
-  // Bounded: only frames that could name a subscription limit.
-  const limitSignals: string[] = [];
+  const fold = newFrameFold();
+  const { out, limitSignals } = fold;
   let stderrHead = '';
   let stderrTail = '';
-  let settled = false;
-  let turnsSoFar = 0;
   const startedAt = Date.now();
   let lastProgressAt = startedAt;
   let thrown: string | undefined;
-  let rateLimited = false;
 
   try {
     const q = query({
@@ -332,29 +429,15 @@ export async function runSession(input: SessionInput): Promise<SessionOutput> {
       const step = await Promise.race([nextFrame, hardDeadline]);
       if (step.done === true) break;
       const msg = step.value;
-      out.sawActivity += 1;
       lastFrameAt = Date.now();
-      if (msg.type === 'assistant') turnsSoFar += 1;
       try {
         appendFileSync(tee, `${JSON.stringify({ ts: Date.now(), ...msg })}\n`);
       } catch { /* the tee is best-effort; never fail a session over logging */ }
 
-      // A subscription cap arrives as synthetic assistant frames tagged
-      // `error: "rate_limit"` ("You've hit your limit · resets 4:30pm"). Read as
-      // ordinary turns they burn the whole maxTurns cap before settling as
-      // error_max_turns, hiding the real cause.
-      if (msg.type === 'assistant' && !settled) {
-        const errTag = typeof msg.error === 'string' ? msg.error : '';
-        const content = (msg.message as { content?: Array<{ text?: string }> } | undefined)?.content ?? [];
-        const texts = content.map((c) => c.text ?? '').join(' ');
-        if (errTag === 'rate_limit' || looksLikeUsageLimit(texts)) {
-          limitSignals.push(errTag, texts);
-          rateLimited = true;
-          out.error = `rate_limit: ${texts.slice(0, 200) || errTag}`;
-          ac.abort();
-          armForce();
-          break;
-        }
+      if (foldFrame(fold, msg, iid) === 'stop') {
+        ac.abort();
+        armForce();
+        break;
       }
 
       // Heartbeat. `turns` arrives only in the result frame, so counting
@@ -362,38 +445,7 @@ export async function runSession(input: SessionInput): Promise<SessionOutput> {
       if (Date.now() - lastProgressAt >= PROGRESS_EVERY_MS) {
         lastProgressAt = Date.now();
         const mins = Math.round((Date.now() - startedAt) / 60_000);
-        log.info(`ticket #${iid} working turns=${turnsSoFar}/${caps.maxTurns} elapsed=${mins}m/${caps.timeoutMin}m messages=${out.sawActivity}`);
-      }
-
-      if (msg.type === 'result') {
-        // The FIRST result frame settles the session, and only the first.
-        // Observed live: a 'success' frame carrying the real turns and usage,
-        // then an 'error_during_execution' frame carrying zero of each. Read as
-        // the outcome, the trailing frame failed a passing session and pushed
-        // its text into limitSignals, where one limit-shaped string parks the
-        // conductor on an account that was never limited.
-        if (settled) {
-          log.warn(`ticket #${iid}: extra result frame ignored`, { subtype: msg.subtype });
-          continue;
-        }
-        settled = true;
-        out.turns = msg.num_turns;
-        out.sessionId = msg.session_id;
-        out.durationMs = msg.duration_ms;
-        out.apiDurationMs = msg.duration_api_ms;
-        out.costUsd = msg.total_cost_usd;
-        out.modelUsage = msg.modelUsage;
-        out.resultSubtype = msg.subtype;
-        if (msg.subtype === 'success') {
-          out.result = parseTicketResult(msg.structured_output);
-          if (!out.result) {
-            out.error = NO_STRUCTURED_OUTPUT;
-            limitSignals.push(msg.result);
-          }
-        } else {
-          out.error = `${msg.subtype}: ${(msg.errors ?? []).join('; ').slice(0, 300)}`;
-          limitSignals.push(...(msg.errors ?? []));
-        }
+        log.info(`ticket #${iid} working turns=${fold.turns}/${caps.maxTurns} elapsed=${mins}m/${caps.timeoutMin}m messages=${out.sawActivity}`);
       }
     }
   } catch (err) {
@@ -407,6 +459,7 @@ export async function runSession(input: SessionInput): Promise<SessionOutput> {
 
   // Why the attempt ended, read off the flags rather than off the catch alone:
   // an aborted stream may end quietly instead of throwing.
+  const { settled } = fold;
   if (settled) {
     // The result frame already decided this attempt; a stream that would not
     // close afterwards is noise, not a verdict.
@@ -437,11 +490,8 @@ export async function runSession(input: SessionInput): Promise<SessionOutput> {
   }
 
   out.stderrTail = stderrTail;
-  // The short-circuit parks on its own say-so; any other path parks only when
-  // what it collected reads as a subscription limit.
-  const signalText = limitSignals.join('\n');
-  if (rateLimited || looksLikeUsageLimit(signalText)) {
-    parkForQuota(signalText);
+  if (shouldPark(fold)) {
+    parkForQuota(limitSignals.join('\n'));
     out.status = 'parked';
   } else {
     // A settled session is judged by its result frame: a watchdog or a cancel

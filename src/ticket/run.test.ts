@@ -8,22 +8,33 @@ import '../lib/test-project-env.js';
 import '../lib/test-scratch-home.js';
 import { attemptLoop, decideClaim, leaseFor, outcomeOf, CLAIM_COOLDOWN_MS, type LeaseDeps } from './run.js';
 import { readJournal, ensureRunDirs, writeJournal, type RunJournal } from '../lib/journal.js';
+import { foldFrame, newFrameFold } from './session.js';
 
 const base = { iid: 7, runId: 'r-7', ticket: { iid: 7, title: 't', description: '', labels: [], notes: [], documents: [], externalDocs: [] }, worktree: '/wt', branch: 'b', port: 8000 };
 const out = (status: string, extra: Record<string, unknown> = {}) => ({ status, result: null, turns: 1, sawActivity: 1, stderrTail: '', ...extra });
 
-test('an infra death retries once with resume when a session id exists, and records both attempts', async () => {
+/** What runSession returns for a session that stalled mid-work: frames carrying its id, and no result frame. */
+function diedWithoutResult(sessionId: string) {
+  const f = newFrameFold();
+  foldFrame(f, { type: 'system', subtype: 'init', session_id: sessionId } as never);
+  foldFrame(f, { type: 'assistant', session_id: sessionId, message: { content: [{ type: 'text', text: 'planning' }] } } as never);
+  return { ...f.out, status: 'infra' as const, error: 'stalled: no stream message for 15m' };
+}
+
+test('an infra death with no result frame still retries with resume on the id its frames carried, and records both attempts', async () => {
   ensureRunDirs(7); writeJournal({ runId: 'r-7', iid: 7, project: 'erp', title: 't', url: 'u', createdAt: 1, status: 'running', pid: process.pid, phases: [] });
   const seen: Array<{ lap: number; resume?: string; previousAttempt: boolean }> = [];
   const final = await attemptLoop(base as never, async (input) => {
     seen.push({ lap: input.lap, resume: input.resume, previousAttempt: input.previousAttempt });
-    return (input.lap === 0 ? out('infra', { sessionId: 's-0', error: 'stalled' }) : out('ok', { sessionId: 's-1' })) as never;
+    return (input.lap === 0 ? diedWithoutResult('s-0') : out('ok', { sessionId: 's-1' })) as never;
   });
   assert.equal(final.status, 'ok');
   assert.deepEqual(seen, [{ lap: 0, resume: undefined, previousAttempt: false }, { lap: 1, resume: 's-0', previousAttempt: true }]);
   const j = readJournal(7)!;
   assert.equal(j.phases.length, 2);
   assert.equal(j.phases[0]!.status, 'infra');
+  assert.equal(j.phases[0]!.resultSubtype, undefined);
+  assert.equal(j.phases[0]!.sessionId, 's-0', 'the journal keeps the id, so the next boot can resume it too');
   assert.equal(j.phases[1]!.resumed, true);
 });
 
