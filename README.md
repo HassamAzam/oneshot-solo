@@ -73,6 +73,24 @@ selector line; `WORK_REPO` does not exist; or `WORK_REPO` or the seed is a clone
 different project. `ONESHOT_SKIP_REPO_CHECK=1` turns the origin refusals into warnings and
 says so on every boot.
 
+## Starting a ticket from the dashboard
+
+Instead of a command: `npm run dashboard`, type the ticket number into the box at the top of
+<http://localhost:8787> and press **Run**. The dashboard queues it as `state/queue/<iid>.json`
+and the conductor's next tick (≤ 60 s) runs it exactly as `npm start -- --ticket <iid>` would:
+no `Loop` label needed, the blocked cooldown waived, a run that stopped mid-way resumed from
+its journal. Queued tickets go before the board, oldest first, and wait while a run is live
+or GitLab is unreachable. A number GitLab cannot read leaves the queue with a
+`cannot read #<iid>` line in the conductor's log and no run.
+
+The conductor has to be running for anything to happen. The page says whether it is
+(`npm run status` prints the same as its first line, and the queue under it); when it is not,
+**Start it** launches one in the background — `tsx src/index.ts`, detached, so it outlives the
+dashboard, with its output in `state/conductor.log`. Stop it with
+`kill $(cat state/conductor.pid)`, which winds the run up like Ctrl-C. The index lists the run
+in flight first, marked `● running`. To drop a queued ticket, delete its file from
+`state/queue/`. Only a POST from the dashboard's own page is accepted.
+
 ## Reading a run
 
 - `npm run status` — one line per run, archived runs included: ticket, title, status,

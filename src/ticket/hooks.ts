@@ -19,9 +19,10 @@
  *   - a project PACK, hooks/packs/<name>/, named by config/project.json
  *     `hookPack` and described by that directory's pack.json manifest.
  *
- * A guard child gets guardEnv(): PATH, HOME, CONTEXT_REPO and ONESHOT_* only —
- * never the conductor's full environment, which can hold the GitLab token and
- * Anthropic credentials a guard has no use for.
+ * A guard child gets guardEnv(): PATH, HOME, CONTEXT_REPO and ONESHOT_* only,
+ * less the two ONESHOT_ credentials — never the conductor's full environment,
+ * which can hold the GitLab token and Anthropic credentials a guard has no use
+ * for.
  *
  * Every guard fails OPEN — timeout, spawn error, non-JSON — because a broken
  * guard must never wedge a session. FAIL_CLOSED is the escape hatch for a guard
@@ -76,15 +77,22 @@ function guardFailure(label: string, why: string): HookOutput {
 }
 
 /**
+ * The two ONESHOT_ variables that are credentials: the conductor's GitLab token
+ * and the managed test login the session signs in with. No guard reads either.
+ */
+const GUARD_WITHHELD = new Set(['ONESHOT_GITLAB_TOKEN', 'ONESHOT_TEST_LOGIN']);
+
+/**
  * The environment a guard child runs with: PATH, HOME, CONTEXT_REPO and every
- * ONESHOT_* — from the conductor's own environment, overlaid by `env` (the
- * session's identity, which wins). Nothing else: no GitLab token, no Anthropic
- * key, no CLAUDE_CODE_USE_*.
+ * ONESHOT_* but the credentials in GUARD_WITHHELD — from the conductor's own
+ * environment, overlaid by `env` (the session's identity, which wins). Nothing
+ * else: no GitLab token in any spelling, no test login, no Anthropic key, no
+ * CLAUDE_CODE_USE_*.
  */
 export function guardEnv(env: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries({ ...process.env, ...env })) {
-    if (v === undefined) continue;
+    if (v === undefined || GUARD_WITHHELD.has(k)) continue;
     if (k === 'PATH' || k === 'HOME' || k === 'CONTEXT_REPO' || k.startsWith('ONESHOT_')) out[k] = v;
   }
   return out;

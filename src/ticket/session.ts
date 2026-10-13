@@ -158,6 +158,9 @@ export function sessionEnv(input: SessionInput): Record<string, string> {
       { worktree: input.worktree, writeScopes: [input.worktree, artifactDir(input.iid)], port: input.port, branch: input.branch },
     ),
     ONESHOT_ARTIFACTS: artifactDir(input.iid),
+    // ONESHOT_TICKET under the name harness.cjs and app.cjs read: without it
+    // their run files land in state/runs/adhoc instead of this run's directory.
+    ONESHOT_IID: String(input.iid),
     ONESHOT_TICKET_LABELS: input.ticket.labels.join(','),
     ...(repoIdentity().repo ? { ONESHOT_PROJECT_PATH: repoIdentity().repo!.project } : {}),
     ...(input.projectId ? { ONESHOT_PROJECT_ID: String(input.projectId) } : {}),

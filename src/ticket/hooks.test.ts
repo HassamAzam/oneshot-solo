@@ -6,13 +6,18 @@ import { join } from 'node:path';
 import '../lib/test-project-env.js';
 import { hooksFor, guardEnv, packManifest } from './hooks.js';
 
-test('guardEnv forwards only PATH, HOME, CONTEXT_REPO and ONESHOT_*', () => {
+test('guardEnv forwards only PATH, HOME, CONTEXT_REPO and ONESHOT_*, never the two ONESHOT_ credentials', () => {
   // guardEnv overlays the conductor's own process.env, and config.ts loads this
   // desk's .env into it on import; scrub what it could forward so the answer
   // does not depend on how the desk is configured.
   for (const k of Object.keys(process.env)) if (k.startsWith('ONESHOT_') || k === 'CONTEXT_REPO') delete process.env[k];
-  const env = guardEnv({ ONESHOT_PHASE: 'ticket', GITLAB_TOKEN: 'glpat-x', ANTHROPIC_API_KEY: 'sk', PATH: '/bin', HOME: '/h', CONTEXT_REPO: '/c', FOO: 'bar' });
-  assert.deepEqual(Object.keys(env).sort(), ['CONTEXT_REPO', 'HOME', 'ONESHOT_PHASE', 'PATH']);
+  process.env.ONESHOT_GITLAB_TOKEN = 'glpat-conductor';                  // the conductor's own token
+  try {
+    const env = guardEnv({ ONESHOT_PHASE: 'ticket', ONESHOT_TEST_LOGIN: 'qa@example.com:pw', GITLAB_TOKEN: 'glpat-x', ANTHROPIC_API_KEY: 'sk', PATH: '/bin', HOME: '/h', CONTEXT_REPO: '/c', FOO: 'bar' });
+    assert.deepEqual(Object.keys(env).sort(), ['CONTEXT_REPO', 'HOME', 'ONESHOT_PHASE', 'PATH']);
+  } finally {
+    delete process.env.ONESHOT_GITLAB_TOKEN;
+  }
 });
 
 test('hooksFor registers the six core guards and the erp pack from its manifest', () => {
