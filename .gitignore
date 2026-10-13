@@ -22,3 +22,6 @@ logs/
 /evidence_upload/
 
 # Planning docs never get committed
+
+# Subagent-driven-development workspace (ledger, briefs, review packages)
+.superpowers/
