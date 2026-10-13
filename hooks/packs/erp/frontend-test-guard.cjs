@@ -66,7 +66,7 @@
  * that wedges the phase costs the whole run.
  */
 const path = require('node:path');
-const C = require(path.join(__dirname, '_common.cjs'));
+const C = require(path.join(__dirname, '..', '..', '_common.cjs'));
 
 C.bailIfNotOneshot();
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * PreToolUse: keep this repo's .env out of a session.
+ * PreToolUse: keep this machine's credential files out of a session — this
+ * repo's .env, the desk's GitLab token file (~/.config/oneshot/gitlab-token)
+ * and Claude Code's own ~/.claude.json.
  *
  * WHAT THIS IS NOT PROTECTING AGAINST. `GITLAB_TOKEN` never reaches a phase.
  * The session environment in src/lib/config.ts is a WHITELIST — PATH, HOME,
@@ -10,7 +12,7 @@
  * subprocess. The skills' "never print GITLAB_TOKEN" rule is already true by
  * construction for the environment.
  *
- * WHAT IT IS. The one path left is the file. `.env` is mode 600 and the phase
+ * WHAT IT IS. The one path left is the file. `.env` is mode 600 and the session
  * runs as its owner, so `cat`, `grep`, a Read or Grep tool call or a
  * heredoc-free `sed -n` all reach it, and everything a phase prints goes into a
  * transcript that outlives the run. This closes that, and nothing else — a
@@ -19,12 +21,17 @@
  * file, not a sandbox: `sudo cat`, `python -c open(...)` and friends are not
  * parsed, which is why the skills still carry "never print GITLAB_TOKEN".
  *
- * Writes are denied too, by redirect as much as by `sed -i`. A blind `>` over
- * this file blanks GITLAB_TOKEN and every later session on the machine starts
- * with no GitLab tools; fixing a credential here is an operator's job.
+ * The token has a second home: src/lib/token.ts reads the desk's
+ * ~/.config/oneshot/gitlab-token before .env, so that file is the same secret
+ * by another path. ~/.claude.json carries the Claude account's OAuth state and
+ * every MCP server's configured env; a session has no reason to read either.
  *
- * Scoped to this repo's own .env. A work repo's .env belongs to the app the
- * phase is there to run, and blocking it would break bringing that app up.
+ * Writes are denied too, by redirect as much as by `sed -i`. A blind `>` over
+ * one of these blanks the credential and every later session on the machine
+ * starts without it; fixing a credential here is an operator's job.
+ *
+ * Scoped to these exact files. A work repo's .env belongs to the app the
+ * session is there to run, and blocking it would break bringing that app up.
  */
 const os = require('node:os');
 const path = require('node:path');
@@ -36,20 +43,38 @@ const READ_TOOLS = new Set(['Read', 'NotebookRead', 'Grep']);
 const ENV_FILE = path.join(C.ONESHOT, '.env');
 const HOME = os.homedir();
 
-const DENIAL =
-  `Denied: ${ENV_FILE} holds this machine's credentials, and everything a phase prints ` +
+/** Every file this guard keeps a session away from, compared realpath to realpath. */
+const DENIED = [
+  ENV_FILE,
+  path.join(HOME, '.config', 'oneshot', 'gitlab-token'),
+  path.join(HOME, '.claude.json'),
+];
+const DENIED_REAL = DENIED.map((f) => C.realish(f));
+
+/** The denied file `target` resolves to, or '' when it is none of them. */
+function deniedFile(target) {
+  const i = DENIED_REAL.indexOf(C.realish(target));
+  return i === -1 ? '' : DENIED[i];
+}
+
+const denial = (file) =>
+  `Denied: ${file} holds this machine's credentials, and everything a session prints ` +
   'lands in a transcript that outlives the run.\n' +
   'Nothing here needs it: the session environment is a whitelist, so the token is not in ' +
   'your environment either — it goes straight to the GitLab MCP server, which is how the ' +
   'mcp__gitlab__* tools are already authenticated for you. Use those tools.\n' +
   'Writing it is denied for the same reason: a credential in this file that is missing, ' +
-  'wrong or expired is a human fix, not a phase\'s — including `remediate`\'s.\n' +
+  'wrong or expired is a human fix, not a session\'s.\n' +
   'If something genuinely cannot proceed without a credential, report that in `blocked` ' +
-  '(or `humanNeeded`: the variable and what it should be, never its value); ' +
+  '(the variable and what it should be, never its value); ' +
   'an operator resolves it, not you.';
 
-/** A candidate path must END at `.env`, so `.env.example` and `.env.local` are not it. */
-const CANDIDATE = /(?:^|[\s'"<>|])([^\s'"<>|]*\.env)(?=$|[\s'"<>|])/g;
+/**
+ * A candidate path must END at one of the denied basenames, so `.env.example`
+ * and `.env.local` are not it. Whether it is the denied file is decided after
+ * expansion and resolution, by deniedFile().
+ */
+const CANDIDATE = /(?:^|[\s'"<>|])([^\s'"<>|]*(?:\.env|gitlab-token|\.claude\.json))(?=$|[\s'"<>|])/g;
 const READER = /^\s*(cat|bat|less|more|head|tail|grep|egrep|rg|awk|sed|cut|sort|strings|xxd|od|open|cp|scp|rsync|source|\.)\b/;
 const WRITER = /^\s*(tee|dd|truncate|mv|ln|install)\b/;
 
@@ -74,9 +99,10 @@ try {
 
   if (READ_TOOLS.has(tool)) {
     const target = expand(input.file_path || input.notebook_path || input.path || '');
-    if (target && C.realish(target) === C.realish(ENV_FILE)) {
-      C.event('denied_env_read', { tool, target });
-      C.deny(DENIAL);
+    const file = target && deniedFile(target);
+    if (file) {
+      C.event('denied_secret_read', { tool, target });
+      C.deny(denial(file));
     }
   }
 
@@ -88,7 +114,7 @@ try {
 
     for (const segment of segments(input.command)) {
       // A bare mention is not a read. `grep -rn GITLAB_TOKEN src/` is a
-      // legitimate thing for a phase to do; it is the path that matters, and
+      // legitimate thing for a session to do; it is the path that matters, and
       // only when the segment reads or writes it — by command or by redirect.
       const verb = READER.test(segment) || WRITER.test(segment);
       for (const m of segment.matchAll(CANDIDATE)) {
@@ -96,9 +122,10 @@ try {
         if (!verb && !/[<>]\s*['"]?$/.test(before)) continue;
         const candidate = expand(m[1]);
         const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(cwd, candidate);
-        if (C.realish(resolved) === C.realish(ENV_FILE)) {
-          C.event('denied_env_bash', { segment: segment.slice(0, 120) });
-          C.deny(DENIAL);
+        const file = deniedFile(resolved);
+        if (file) {
+          C.event('denied_secret_bash', { segment: segment.slice(0, 120) });
+          C.deny(denial(file));
         }
       }
     }

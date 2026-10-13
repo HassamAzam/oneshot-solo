@@ -30,7 +30,7 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const { execFile } = require('node:child_process');
-const C = require(path.join(__dirname, '_common.cjs'));
+const C = require(path.join(__dirname, '..', '..', '_common.cjs'));
 
 C.bailIfNotOneshot();
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * SessionStart: put the conditions that hide a real bug in front of `research`
- * before it plans a reproduction.
+ * SessionStart: put the conditions that hide a real bug in front of a bug
+ * ticket's session before it plans a reproduction.
  *
  * WHY A HOOK AND NOT A PROMPT LINE. `bug-reproduction/SKILL.md` already says to
  * read `refs/why-it-did-not-reproduce.md`, and that instruction has now been
@@ -20,12 +20,12 @@
  * time they are a post-mortem; read at planning time they change what gets run.
  * That is why this fires at SessionStart rather than on a write.
  *
- * SCOPE. `research` only — the one phase that decides a reproduction. Other
- * phases exit before reading anything: `verify` executes a list it did not
- * write, and `implement` does not need a reproduction checklist competing with
- * its own standards for attention. The brief leads with its own applicability
- * so a feature ticket, whose research records `not-applicable`, drops it in a
- * line rather than reading six KB that cannot apply.
+ * SCOPE. Tickets labelled `Bug` only, read from ONESHOT_TICKET_LABELS (the
+ * comma list the conductor puts in the session env). It used to self-gate on
+ * the `research` phase; Solo has one `ticket` session, so the label is the only
+ * thing left that says whether a reproduction is planned at all. A feature
+ * ticket exits before reading anything. The brief still leads with its own
+ * applicability, for the bug that turns out to need no reproduction.
  *
  * FAILS OPEN, loudly. A missing or unreadable reference must never wedge the
  * phase — the prompt still carries the method, and a reproduction attempted
@@ -36,11 +36,10 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
-const C = require(path.join(__dirname, '_common.cjs'));
+const C = require(path.join(__dirname, '..', '..', '_common.cjs'));
 
 C.bailIfNotOneshot();
 
-const PHASE = 'research';
 const SKILL = 'bug-reproduction';
 const REF = 'why-it-did-not-reproduce.md';
 
@@ -60,10 +59,11 @@ const MAX_INLINE_BYTES = 24_000;
  * and the hook would log `repro_conditions_missing` and inject nothing — while
  * the session still resolves the skill fine through its composed `.claude`. The
  * mode you would rehearse this in is the one mode it would not fire in. The
- * hook lives beside the roots it is looking for, so `__dirname/..` is exact and
- * independent of where state happens to be pointed.
+ * hook lives at a fixed depth below the roots it is looking for
+ * (hooks/packs/erp/), so `__dirname/../../..` is exact and independent of where
+ * state happens to be pointed.
  */
-const REPO = path.join(__dirname, '..');
+const REPO = path.join(__dirname, '..', '..', '..');
 
 function refPath() {
   const root = C.expandTilde(process.env.ONESHOT_SKILLS_ROOT || path.join(REPO, 'context'));
@@ -79,15 +79,15 @@ function inject(context) {
   process.exit(0);
 }
 
-if (C.phase() !== PHASE) C.allow();
+const labels = String(process.env.ONESHOT_TICKET_LABELS || '').split(',').map((s) => s.trim().toLowerCase());
+if (!labels.includes('bug')) C.allow();
 
 /**
- * Project-level gate. The per-ticket `Bug` label is genuinely not reachable from
- * a SessionStart hook, but the project switch is — and with reproduction off,
- * `reproductionBlock()` tells research to record `not-applicable` and never
- * start the app, so a brief about reading account flags and enumerating filter
- * options would contradict the prompt it arrives beside. Fails open: an
- * unreadable config injects rather than silently going quiet.
+ * Project-level gate, after the label: with reproduction off, the prompt tells
+ * the session to record `not-applicable` and never start the app, so a brief
+ * about reading account flags and enumerating filter options would contradict
+ * the prompt it arrives beside. Fails open: an unreadable config injects rather
+ * than silently going quiet.
  */
 const project = C.loadConfig('project.json');
 if (project && project.bugReproduction === false) {

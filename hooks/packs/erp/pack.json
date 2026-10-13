@@ -1,0 +1,9 @@
+[
+  { "script": "frontend-test-guard.cjs", "event": "PreToolUse",  "matcher": "^(Write|Edit|NotebookEdit)$", "timeoutMs": 15000 },
+  { "script": "migration-standards.cjs", "event": "PostToolUse", "matcher": "^(Write|Edit|NotebookEdit)$", "timeoutMs": 20000 },
+  { "script": "script-standards.cjs",    "event": "PostToolUse", "matcher": "^(Write|Edit|NotebookEdit)$", "timeoutMs": 20000 },
+  { "script": "py-lint.cjs",             "event": "PostToolUse", "matcher": "^(Write|Edit|NotebookEdit)$", "timeoutMs": 60000 },
+  { "script": "js-standards.cjs",        "event": "PostToolUse", "matcher": "^(Write|Edit|NotebookEdit)$", "timeoutMs": 15000 },
+  { "script": "traps-brief.cjs",         "event": "SessionStart", "timeoutMs": 15000 },
+  { "script": "repro-conditions.cjs",    "event": "SessionStart", "timeoutMs": 15000 }
+]
