@@ -264,10 +264,16 @@ function seedPath(): ResolvedPath {
 }
 
 /**
- * The installed clone a leased worktree borrows node_modules, venv and
- * staticfiles from. Empty means seeding is switched off, which costs `npm ci`
- * minutes per worktree — so it stays a function with no default rather than
- * quietly becoming WORK_REPO.
+ * ONESHOT_SEED_FROM as set: the installed clone a leased worktree borrows
+ * node_modules, venv and staticfiles from. '' when unset — and unset means
+ * WORK_REPO is the seed source: every consumer reads `seedFrom() || WORK_REPO`
+ * (seedWorktree, projectSessionEnv, and app.cjs's own fallback), because the
+ * work repo is itself an installed clone. This returns the raw setting only so
+ * doctor and boot can say which variable supplied the path.
+ *
+ * To seed nothing, empty the lists rather than the source: `seed.links` and
+ * `seed.copies` in config/project.json. A blank ONESHOT_SEED_LINKS= reads as
+ * unset (repourl.cjs readEnv) and falls back to those lists.
  */
 export function seedFrom(): string {
   return seedPath().path;

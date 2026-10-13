@@ -10,12 +10,13 @@
  * attempt's session when it left an id.
  */
 import { existsSync } from 'node:fs';
+import { basename } from 'node:path';
 import { PROJECT_TARGET, appPort, projectConfig, sessionModel } from '../lib/config.js';
 import { getIssue, issueUrl } from '../lib/gitlab.js';
 import {
   archiveRun, ensureRunDirs, pidAlive, readJournal, recordPhase, updateJournal, writeJournal, type RunJournal,
 } from '../lib/journal.js';
-import { detachTrackedClaude, leaseWorktree, type Lease } from '../lib/worktrees.js';
+import { deleteLocalBranch, detachTrackedClaude, leaseWorktree, reapWorktree, type Lease } from '../lib/worktrees.js';
 import { assertComposed, ensureClaudeDir } from '../lib/claudedir.js';
 import { startRunApp } from '../lib/appserver.js';
 import { fetchTicket } from '../lib/ticket.js';
@@ -51,12 +52,17 @@ export type ClaimDecision = 'fresh' | 'resume' | 'refuse';
  * refused. A run that stopped without finishing — aborted (Ctrl-C, a quota
  * park), or claimed/running under a conductor that is gone — is resumed. A
  * finished run (done, or blocked past the cooldown) makes way for a fresh one.
+ *
+ * `force` is an operator naming the ticket (`--ticket <iid>`): the cooldown
+ * exists to stop the scan re-claiming a block nobody has looked at, and an
+ * explicit run is somebody having looked. It bypasses the cooldown only — a
+ * claim held by a live conductor is refused regardless.
  */
-export function decideClaim(existing: RunJournal | null): ClaimDecision {
+export function decideClaim(existing: RunJournal | null, opts: { force?: boolean } = {}): ClaimDecision {
   if (!existing) return 'fresh';
   if (existing.status === 'claimed' || existing.status === 'running') return pidAlive(existing.pid) ? 'refuse' : 'resume';
   if (existing.status === 'aborted') return 'resume';
-  if (existing.status === 'blocked' && Date.now() - (existing.stoppedAt ?? 0) < CLAIM_COOLDOWN_MS) return 'refuse';
+  if (existing.status === 'blocked' && !opts.force && Date.now() - (existing.stoppedAt ?? 0) < CLAIM_COOLDOWN_MS) return 'refuse';
   return 'fresh';
 }
 
@@ -153,6 +159,47 @@ function oneLine(err: unknown): string {
   return (lines.find((l) => /^(fatal|error):/i.test(l)) ?? lines[0] ?? 'unknown error').slice(0, 300);
 }
 
+export interface LeaseDeps {
+  leaseWorktree: typeof leaseWorktree;
+  reapWorktree: typeof reapWorktree;
+  deleteLocalBranch: typeof deleteLocalBranch;
+  exists: (path: string) => boolean;
+}
+
+const REAL_LEASE: LeaseDeps = { leaseWorktree, reapWorktree, deleteLocalBranch, exists: existsSync };
+
+/**
+ * The worktree and branch a claim runs in. The worktree outlives its run
+ * (spec §5.4), and it holds the ticket's branch, so:
+ *
+ * - The previous run MERGED: its branch is history — the MR merged and GitLab
+ *   removed the remote. The old worktree is reaped, the local branch deleted
+ *   (else leaseWorktree would re-attach it), and a fresh lease is cut from
+ *   base under the same name. When git will not delete the branch, the lease
+ *   takes `<branch>-<run id stamp>` instead: a ticket that comes back must
+ *   never continue on merged commits.
+ * - A resumed run, or a ticket that came back while its worktree still exists,
+ *   re-attaches through leaseWorktree under the recorded branch and worktree
+ *   name, so it is re-seeded and its identity re-pinned like any lease.
+ *   (`git worktree add` would refuse the branch while that worktree has it.)
+ * - Otherwise a fresh lease from base on the title's branch.
+ */
+export function leaseFor(
+  iid: number, runId: string, title: string, existing: RunJournal | null, resuming: boolean, deps: LeaseDeps = REAL_LEASE,
+): Lease {
+  const titled = branchFor(projectConfig().branches.prefix, iid, title);
+  if (!resuming && existing?.status === 'done' && existing.merged) {
+    const merged = existing.branch ?? titled;
+    if (existing.worktree) deps.reapWorktree(existing.worktree, existing.runId);
+    const branch = deps.deleteLocalBranch(merged) ? merged : `${merged}-${runId.replace(/^r-/, '').slice(0, 6)}`;
+    log.info(`#${iid} was merged by run ${existing.runId} — cutting a fresh branch ${branch} from base`);
+    return deps.leaseWorktree(runId, branch, worktreeName(iid, runId));
+  }
+  const recorded = existing?.worktree && existing.branch && deps.exists(existing.worktree) ? existing.worktree : null;
+  const branch = (resuming || recorded) && existing?.branch ? existing.branch : titled;
+  return deps.leaseWorktree(runId, branch, recorded ? basename(recorded) : worktreeName(iid, runId));
+}
+
 /** The latest session id the journal recorded, for resuming its conversation. */
 function lastSessionId(j: RunJournal): string | undefined {
   return [...j.phases].reverse().find((p) => p.sessionId)?.sessionId;
@@ -162,9 +209,10 @@ function lastSessionId(j: RunJournal): string | undefined {
  * Claim, prepare, run and finish one ticket. Returns the journal's final
  * status — or, when the ticket was not claimed, the status that stopped it.
  * `opts.signal` is the conductor's shutdown: it reaches the session, which
- * then ends `aborted` and stays resumable.
+ * then ends `aborted` and stays resumable. `opts.force` is `--ticket`: it
+ * bypasses the blocked cooldown (decideClaim).
  */
-export async function runTicket(iid: number, opts: { signal?: AbortSignal } = {}): Promise<RunJournal['status']> {
+export async function runTicket(iid: number, opts: { signal?: AbortSignal; force?: boolean } = {}): Promise<RunJournal['status']> {
   const issue = await getIssue(iid);
   if (!issue.ok || !issue.data) {
     log.error(`cannot read #${iid} — not claiming`, { kind: issue.kind, status: issue.status });
@@ -172,7 +220,7 @@ export async function runTicket(iid: number, opts: { signal?: AbortSignal } = {}
   }
 
   const existing = readJournal(iid);
-  const decision = decideClaim(existing);
+  const decision = decideClaim(existing, { force: opts.force });
   if (decision === 'refuse') {
     log.warn(`#${iid} not claimed: ${refusal(existing!)}`);
     return existing!.status;
@@ -197,22 +245,15 @@ export async function runTicket(iid: number, opts: { signal?: AbortSignal } = {}
       return readJournal(iid)?.status ?? 'blocked';
     }
 
-    // The worktree outlives its run (spec §5.4), and it holds the ticket's
-    // branch: a resumed run continues in it, and so does a fresh run of a
-    // ticket that comes back — `git worktree add` would refuse the branch
-    // while that worktree has it checked out.
-    const recorded = existing?.worktree && existing.branch && existsSync(existing.worktree) ? existing.worktree : null;
-    const branch = (resuming || recorded) && existing?.branch ? existing.branch : branchFor(projectConfig().branches.prefix, iid, ticket.title);
     let lease: Lease;
     try {
-      lease = recorded
-        ? { worktree: recorded, branch, base: projectConfig().branches.base, runId }
-        : leaseWorktree(runId, branch, worktreeName(iid, runId));
+      lease = leaseFor(iid, runId, ticket.title, existing, resuming);
     } catch (err) {
       await finish(iid, runId, { kind: 'blocked', why: `worktree: ${oneLine(err)}` });
       return readJournal(iid)?.status ?? 'blocked';
     }
 
+    const { branch } = lease;
     const port = appPort();
     updateJournal(iid, { status: 'running', branch, worktree: lease.worktree, port });
     // Compiles while the model plans; a failure here is a slower run, not a broken one.

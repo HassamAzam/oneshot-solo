@@ -151,12 +151,13 @@ like `venv` and `node_modules`.
 ## Guardrails
 
 The session holds Bash, the write tools and the MR tools for hours under
-`bypassPermissions`, so five core guards run on every tool call, in-process through the
+`bypassPermissions`, so six core guards run on every tool call, in-process through the
 SDK's `hooks` option and with nothing installed into `~/.claude`: `pause-check` (the
-brake), `write-scope` (writes only in the worktree and the run's artifacts), `git-guard`
-(push only the run's branch, never a protected one, no force push), `secret-guard` (no
-reading `.env` or the token files), and `mr-gate` (the MR title and `[closes …]`
-contract). A project adds its own pack — ERP's lints Python and JS, checks migrations and
+brake), `write-scope` (writes only in the worktree and the run's artifacts), `churn-guard`
+(no whole-file rewrite of an existing file to change part of it), `git-guard` (push only
+the run's branch, never a protected one, no force push, no `git stash`), `secret-guard`
+(no reading `.env`, its backups or the token files), and `mr-gate` (the MR title and
+`[closes …]` contract, this project only, the run's branch into the base). A project adds its own pack — ERP's lints Python and JS, checks migrations and
 briefs the session on known traps. The issue, label, merge and branch-admin GitLab tools
 are denied to the session outright; merging is conductor code.
 
@@ -176,8 +177,8 @@ declared, and how to add one. `npm run hooks:verify` runs the offline allow/deny
   worktree and branch, and the same Claude conversation where a session id was recorded.
 - **`Needs Human`** means the run stopped; the ticket note says why ("Oneshot stopped:
   **…**"). Fix the cause, then swap `Needs Human` back for `Loop`, or run
-  `npm start -- --ticket <iid>`. A blocked ticket is not re-claimed within 30 minutes of
-  stopping.
+  `npm start -- --ticket <iid>`. The scan does not re-claim a blocked ticket within 30
+  minutes of stopping; `--ticket` is the operator's say-so and bypasses that wait.
 - **`npm run reap`** removes worktrees whose MR merged (`--all-done` also takes runs
   whose MR is still open; `--dry-run` only lists). Every run keeps its worktree until then.
 
@@ -202,7 +203,7 @@ is in [docs/superpowers/specs/2026-10-13-oneshot-solo-design.md](docs/superpower
 | SQLite (`runs`, `phase_runs`, `quota_usage`, `events`, `conductors`, `port_leases`, `promotion_lock`) | none: the per-run `run.json` journal plus a pid is the whole state |
 | cross-machine claim notes, settle windows, fleet heartbeats | one desk, one ticket at a time, a pid file |
 | Slack cards, oneshot-board collector, Langfuse/OTel export | nothing leaves the machine |
-| 17 hooks | 5 core guards + an optional per-project pack of 7 |
+| 17 hooks | 6 core guards + an optional per-project pack of 7 |
 | human review gates (`Review`, `Design`, `TestCase Review`), the MR-feedback loop, Ready-For-Automation mode | gone |
 | `report.html` written at finish (9 MB per run) | rendered on demand by the dashboard |
 

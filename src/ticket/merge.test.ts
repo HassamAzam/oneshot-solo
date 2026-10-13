@@ -18,6 +18,13 @@ test('mergeGate merges only when mode=auto, no problems, ≥1 pass, no fail, reg
   assert.equal(mergeGate(ok, { ...mr, detailed_merge_status: 'conflict' } as never, [], 'auto').merge, false);
 });
 
+test('mergeGate: a lone failing case is reported as a failure, not as a missing pass', () => {
+  const r = mergeGate({ summary: 's', cases: [{ id: '1', title: 'a', verdict: 'fail' }] }, mr, [], 'auto');
+  assert.equal(r.merge, false);
+  assert.match(r.why, /case\(s\) failed: 1/);
+  assert.equal(mergeGate({ summary: 's', cases: [{ id: '1', title: 'a', verdict: 'skipped' }] }, mr, [], 'auto').why, 'no case recorded a pass');
+});
+
 test('mergeGate: need_rebase and ci_still_running pass the gate; an absent status is left to GitLab', () => {
   assert.equal(mergeGate(ok, { ...mr, detailed_merge_status: 'need_rebase' } as never, [], 'auto').merge, true);
   assert.equal(mergeGate(ok, { ...mr, detailed_merge_status: 'ci_still_running' } as never, [], 'auto').merge, true);

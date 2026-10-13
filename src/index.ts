@@ -163,7 +163,8 @@ async function tick(): Promise<void> {
   // The one awaited path: it exists to run exactly one ticket and exit.
   if (ticketArg !== null) {
     log.phase(`targeting #${ticketArg}`);
-    log.info(`#${ticketArg} ended ${await runTicket(ticketArg, { signal: aborter.signal })}`);
+    // Naming the ticket is the operator's say-so: it bypasses the blocked cooldown.
+    log.info(`#${ticketArg} ended ${await runTicket(ticketArg, { signal: aborter.signal, force: true })}`);
     return;
   }
 

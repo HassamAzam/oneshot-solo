@@ -50,9 +50,10 @@ function contextRepo() {
 }
 
 /**
- * Scopes are handed in by the conductor rather than derived here, so the
- * allowlist for a phase lives in config/phases.json next to everything else
- * about that phase instead of being duplicated in a hook table.
+ * Scopes are handed in by the conductor rather than derived here: in Solo,
+ * ONESHOT_WRITE_SCOPES is the run's worktree and its artifacts dir
+ * (state/runs/<iid>/artifacts), colon-separated, set in the session env by
+ * src/ticket/session.ts. run.json and the rest of state/ are outside it.
  */
 function allowedScopes() {
   return (process.env.ONESHOT_WRITE_SCOPES || '')

@@ -43,8 +43,7 @@ test('done + manual mode: no merge, Loop→In Review, note says why', async () =
 
 test('done + gate failed (a case failed): In Review with the reason; merge refused: In Review too', async () => {
   fresh(3); const { calls, d } = deps();
-  // A pass beside the fail: mergeGate reports "no case recorded a pass" ahead of failures, so a lone fail would say that instead.
-  await finish(3, 'r-1', { kind: 'done', mr, result: { summary: 's', cases: [{ id: '1', title: 'a', verdict: 'pass' }, { id: '2', title: 'b', verdict: 'fail' }] }, problems: [] }, d as never);
+  await finish(3, 'r-1', { kind: 'done', mr, result: { summary: 's', cases: [{ id: '1', title: 'a', verdict: 'fail' }] }, problems: [] }, d as never);
   assert.ok(!calls.some(([k]) => k === 'merge'));
   assert.match(String(calls.find(([k]) => k === 'note')![1]), /case\(s\) failed/);
   fresh(4); const r = deps({ mergeNow: async () => ({ merged: false, why: 'merge refused: conflict' }) });
@@ -118,4 +117,24 @@ test('the done note escapes model prose and keeps the marker on its own line', a
   assert.match(note, /Fixed the &lt;title&gt; tag/);
   assert.match(note, /- kept &lt;h1&gt;/);
   assert.match(note, /\n<!-- oneshot:note:r-1 -->$/);
+});
+
+test('finish is a no-op once the journal is terminal: a second call on a done run makes no GitLab call', async () => {
+  fresh(11); const first = deps();
+  await finish(11, 'r-1', { kind: 'done', mr, result: ok, problems: [] }, first.d as never);
+  assert.equal(readJournal(11)!.status, 'done');
+  // run.ts's catch-all re-runs finish as blocked when the first finish threw after the merge.
+  const again = deps();
+  await finish(11, 'r-1', { kind: 'blocked', why: 'the conductor failed mid-run: boom' }, again.d as never);
+  assert.deepEqual(again.calls, []);
+  const j = readJournal(11)!;
+  assert.equal(j.status, 'done'); assert.equal(j.merged, true); assert.equal(j.blockedWhy, undefined);
+
+  for (const status of ['blocked', 'aborted'] as const) {
+    fresh(12); const { calls, d } = deps();
+    writeJournal({ ...readJournal(12)!, status });
+    await finish(12, 'r-1', { kind: 'blocked', why: 'again' }, d as never);
+    assert.deepEqual(calls, [], `${status} journal`);
+    assert.equal(readJournal(12)!.status, status);
+  }
 });

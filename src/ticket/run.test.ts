@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import '../lib/test-project-env.js';
 import '../lib/test-scratch-home.js';
-import { attemptLoop, decideClaim, outcomeOf, CLAIM_COOLDOWN_MS } from './run.js';
+import { attemptLoop, decideClaim, leaseFor, outcomeOf, CLAIM_COOLDOWN_MS, type LeaseDeps } from './run.js';
 import { readJournal, ensureRunDirs, writeJournal, type RunJournal } from '../lib/journal.js';
 
 const base = { iid: 7, runId: 'r-7', ticket: { iid: 7, title: 't', description: '', labels: [], notes: [], documents: [], externalDocs: [] }, worktree: '/wt', branch: 'b', port: 8000 };
@@ -86,6 +86,68 @@ test('decideClaim: refuse a live claim and a fresh block; resume an abort or a d
   assert.equal(decideClaim(journal({ status: 'blocked', stoppedAt: Date.now() - 60_000 })), 'refuse');
   assert.equal(decideClaim(journal({ status: 'blocked', stoppedAt: Date.now() - CLAIM_COOLDOWN_MS - 1 })), 'fresh');
   assert.equal(decideClaim(journal({ status: 'done' })), 'fresh');
+});
+
+test('decideClaim with force (--ticket): the blocked cooldown is bypassed; a live claim is still refused', () => {
+  const force = { force: true };
+  assert.equal(decideClaim(journal({ status: 'blocked', stoppedAt: Date.now() - 60_000 }), force), 'fresh');
+  assert.equal(decideClaim(journal({ status: 'running', pid: process.pid }), force), 'refuse');
+  assert.equal(decideClaim(journal({ status: 'claimed', pid: process.pid }), force), 'refuse');
+  assert.equal(decideClaim(journal({ status: 'aborted' }), force), 'resume');
+  assert.equal(decideClaim(journal({ status: 'blocked', stoppedAt: Date.now() - 60_000 }), { force: false }), 'refuse');
+});
+
+/** Injected lease machinery that records every call in order. */
+function leaseDeps(over: Partial<LeaseDeps> & { present?: string[] } = {}) {
+  const calls: unknown[][] = [];
+  const present = new Set(over.present ?? []);
+  const d: LeaseDeps = {
+    leaseWorktree: (runId, branch, name) => { calls.push(['lease', runId, branch, name]); return { worktree: `/wt/${name}`, branch, base: 'dev', runId }; },
+    reapWorktree: (worktree, runId) => { calls.push(['reap', worktree, runId]); },
+    deleteLocalBranch: (branch) => { calls.push(['delete', branch]); return true; },
+    exists: (path) => present.has(path),
+    ...over,
+  };
+  return { calls, d };
+}
+
+test('leaseFor: a merged ticket that comes back reaps the old worktree, deletes its local branch, and cuts fresh from base under the same name', () => {
+  const merged = journal({ runId: 'r-old', status: 'done', merged: true, branch: 'oneshot/ticket-1-t', worktree: '/wt/t1-r-old' });
+  const { calls, d } = leaseDeps({ present: ['/wt/t1-r-old'] });
+  const lease = leaseFor(1, 'r-new', 't', merged, false, d);
+  assert.deepEqual(calls, [
+    ['reap', '/wt/t1-r-old', 'r-old'],
+    ['delete', 'oneshot/ticket-1-t'],
+    ['lease', 'r-new', 'oneshot/ticket-1-t', 't1-r-new'],
+  ]);
+  assert.equal(lease.branch, 'oneshot/ticket-1-t');
+  assert.equal(lease.worktree, '/wt/t1-r-new');
+});
+
+test('leaseFor: when git will not delete the merged branch, the fresh lease takes a run-stamped branch name', () => {
+  const merged = journal({ runId: 'r-old', status: 'done', merged: true, branch: 'oneshot/ticket-1-t', worktree: '/wt/t1-r-old' });
+  const { calls, d } = leaseDeps({ deleteLocalBranch: (b) => { calls.push(['delete', b]); return false; } });
+  const lease = leaseFor(1, 'r-mgo3abcd-1a2b3c', 't', merged, false, d);
+  assert.deepEqual(calls.at(-1), ['lease', 'r-mgo3abcd-1a2b3c', 'oneshot/ticket-1-t-mgo3ab', 't1-r-mgo3abcd-1a2b3c']);
+  assert.equal(lease.branch, 'oneshot/ticket-1-t-mgo3ab');
+});
+
+test('leaseFor: an unmerged ticket whose worktree still exists re-attaches through leaseWorktree under the recorded name and branch', () => {
+  const inReview = journal({ runId: 'r-old', status: 'done', merged: false, branch: 'oneshot/ticket-1-old-title', worktree: '/somewhere/t1-r-old' });
+  const a = leaseDeps({ present: ['/somewhere/t1-r-old'] });
+  assert.equal(leaseFor(1, 'r-new', 'a new title', inReview, false, a.d).branch, 'oneshot/ticket-1-old-title');
+  assert.deepEqual(a.calls, [['lease', 'r-new', 'oneshot/ticket-1-old-title', 't1-r-old']]);
+
+  // Resumed: same run id, same worktree, re-seeded through the lease.
+  const dead = journal({ runId: 'r-old', status: 'running', branch: 'oneshot/ticket-1-old-title', worktree: '/somewhere/t1-r-old' });
+  const b = leaseDeps({ present: ['/somewhere/t1-r-old'] });
+  leaseFor(1, 'r-old', 't', dead, true, b.d);
+  assert.deepEqual(b.calls, [['lease', 'r-old', 'oneshot/ticket-1-old-title', 't1-r-old']]);
+
+  // No journal: a fresh lease on the title's branch.
+  const c = leaseDeps();
+  assert.equal(leaseFor(1, 'r-new', 'Add Export', null, false, c.d).branch, 'oneshot/ticket-1-add-export');
+  assert.deepEqual(c.calls, [['lease', 'r-new', 'oneshot/ticket-1-add-export', 't1-r-new']]);
 });
 
 test('outcomeOf: a parked session is aborted without classifying; a done verdict passes through', async () => {

@@ -48,7 +48,7 @@ a one-line change if wrong.
 | SQLite (`runs`, `phase_runs`, `quota_usage`, `events`, `conductors`, `port_leases`, `promotion_lock`) | none; the per-run `run.json` journal plus a pid is the whole state |
 | cross-machine claim notes, settle windows, fleet heartbeats | one desk, `concurrency: 1`, a pid file |
 | Slack cards, oneshot-board collector, Langfuse/OTel export | nothing leaves the machine |
-| 17 hooks | 5 core guards + an optional per-project pack of 7 |
+| 17 hooks | 6 core guards (`churn-guard` added) + an optional per-project pack of 7 |
 | human review gates (`Review`, `Design`, `TestCase Review` labels), MR-feedback loop, Ready-For-Automation mode | gone |
 | `report.html` written at finish (9 MB per run) | rendered on demand by the dashboard |
 
@@ -79,7 +79,7 @@ npm run status                              scripts/status.ts → src/lib/teleme
 The conductor is code and never holds a model. The session is the only model and holds every
 tool the ticket needs — Bash, Read/Write/Edit, the GitLab MCP server (MR tools allowed,
 issue/label/merge/branch-protection tools denied), Playwright via the project's harness —
-behind the five core guards.
+behind the six core guards.
 
 ## 4. The session
 
@@ -434,8 +434,9 @@ Hooks stay in-process: `src/ticket/hooks.ts` (lifted `hooksFor`) bridges SDK hoo
 
 | hook | event | guards |
 |---|---|---|
-| `git-guard.cjs` | PreToolUse Bash | no force push; push only `ONESHOT_BRANCH`; never a protected branch; no `branch -D` of protected; no `remote set-url`; no `gh`/`glab`; git cwd fenced to the worktree. `checkConductorPhase` / `checkReadOnlyWorktreePhase` deleted (unreachable). |
+| `git-guard.cjs` | PreToolUse Bash | no force push; push only `ONESHOT_BRANCH`; never a protected branch; no `branch -D` of protected; no `remote set-url`; no `gh`/`glab`; git cwd fenced to the worktree; no `git stash` in any form (a stash left behind is work the MR never carries). `checkConductorPhase` / `checkReadOnlyWorktreePhase` deleted (unreachable). |
 | `write-scope.cjs` | PreToolUse Write/Edit/NotebookEdit | writes confined to `ONESHOT_WRITE_SCOPES` (worktree + artifacts), realpath-resolved; hard-denies the harness, `~/.claude`, the context repo. Unchanged. |
+| `churn-guard.cjs` | PreToolUse Write | denies a `Write` that replaces an existing file of 40+ lines with fewer than half of them — a partial change done as a whole-file rewrite; points the model at `Edit`. New files, short files and `Edit` are never judged. Registered after `write-scope`. |
 | `secret-guard.cjs` | PreToolUse Read/Grep/Bash | denies reading `.env`, **and now** `~/.config/oneshot/gitlab-token` and `~/.claude.json`. `report.ts` `redact()` is the second layer. |
 | `mr-gate.cjs` | PreToolUse create/update_merge_request | title convention and `[closes <url>]` line — now the only enforcement, since the session opens the MR. |
 | `pause-check.cjs` | PreToolUse all | `state/PAUSE*` → deny writes/Bash/MCP, allow reads, "stop and summarise". The only graceful brake on a run in flight. |
@@ -471,7 +472,7 @@ widened `secret-guard`.
 | `src/ticket/outcome.ts` | result classification; MR lookup and post-check |
 | `src/ticket/finish.ts`, `src/ticket/merge.ts` | labels, note, merge gate, teardown |
 | `src/lib/` | `config`, `repourl.cjs`, `token`, `identity`, `gitlab`, `gitlabmd`, `worktrees`, `gitfetch`, `claudedir`, `ids`, `journal` (was `artifacts`), `ticketdocs`, `reachability`, `quota` (park only), `accountgate`, `appserver`, `repocheck`, `envfile`, `envdrift`, `log`, `report`, `transcript`, `telemetry` |
-| `hooks/` | 5 core guards + `_common.cjs`; `hooks/packs/erp/` 7 |
+| `hooks/` | 6 core guards + `_common.cjs`; `hooks/packs/erp/` 7 |
 | `skills/` | `ship-ticket`, `local-browser-verify`, `change-scoping`, `prior-art-survey`, `bug-reproduction` |
 | `context/` | the project's skills/agents/rules (`SKILLS_ROOT`) |
 | `config/project.json` | the only config file |

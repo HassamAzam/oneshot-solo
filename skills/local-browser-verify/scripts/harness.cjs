@@ -111,12 +111,13 @@ function runDir() {
 }
 
 /**
- * Everything the harness writes goes under state/runs/<iid>/harness/.
+ * Everything the harness writes goes under the run directory's harness/.
  *
- * That directory is already inside the write scope of verify, ui-evidence AND qa
- * (config/phases.json gives all three `"writes": ["run"]`, and hooks/write-scope.cjs
- * maps "run" to state/runs/<iid>). Four of six ui-evidence sessions were denied writing
- * to <worktree>/.verify-scratch/, which is what the old prompt told them to use.
+ * That directory is NOT inside the session's write scopes: in Solo,
+ * ONESHOT_WRITE_SCOPES is the worktree and the artifacts dir, set by the conductor.
+ * It does not need to be — this script writes it from its own node process, which
+ * hooks/write-scope.cjs (Write/Edit/NotebookEdit only) never sees. A session keeps
+ * the evidence it wants in $ONESHOT_ARTIFACTS, never beside these files.
  */
 const H = () => path.join(runDir(), 'harness');
 const ART = () => path.join(runDir(), 'artifacts');

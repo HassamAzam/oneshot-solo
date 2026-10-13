@@ -17,9 +17,10 @@ export function mergeGate(result: TicketResult, mr: MergeRequest, problems: stri
   if (mode !== 'auto') return { merge: false, why: 'merge.mode is manual' };
   if (problems.length) return { merge: false, why: problems.join('; ') };
   const cases = result.cases ?? [];
-  if (!cases.some((c) => c.verdict === 'pass')) return { merge: false, why: 'no case recorded a pass' };
+  // Failures first: a lone failing case is reported as the failure it is, not as a missing pass.
   const fails = cases.filter((c) => c.verdict === 'fail');
   if (fails.length) return { merge: false, why: `${fails.length} case(s) failed: ${fails.map((c) => c.id).join(', ')}` };
+  if (!cases.some((c) => c.verdict === 'pass')) return { merge: false, why: 'no case recorded a pass' };
   const desc = (mr.description ?? '').toLowerCase();
   const unlisted = (result.regressions ?? []).filter((r) => !desc.includes(r.toLowerCase().slice(0, 40)));
   if (unlisted.length) return { merge: false, why: `regression(s) not listed in the MR: ${unlisted.join('; ')}` };

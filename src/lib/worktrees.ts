@@ -352,6 +352,24 @@ export function leaseWorktree(runId: string, branch: string, name: string): Leas
   return { worktree, branch, base, runId };
 }
 
+/**
+ * Delete a local branch in WORK_REPO — only ever one whose MR has merged, so
+ * nothing is lost. True when the branch is gone afterwards (deleted, or never
+ * there); false when git refused, typically because a worktree it could not
+ * remove still has it checked out.
+ */
+export function deleteLocalBranch(branch: string): boolean {
+  try { git(['rev-parse', '--verify', `refs/heads/${branch}`]); } catch { return true; }
+  try {
+    git(['branch', '-D', branch]);
+    log.info(`deleted local branch ${branch} (its MR merged)`);
+    return true;
+  } catch (err) {
+    log.warn(`could not delete local branch ${branch}`, { error: (err as Error).message.split('\n')[0] });
+    return false;
+  }
+}
+
 /** Remove the worktree. The BRANCH is deliberately left alone — it is pushed work. */
 export function reapWorktree(worktree: string, runId: string): void {
   if (!existsSync(worktree)) return;

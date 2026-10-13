@@ -80,9 +80,20 @@ async function undraft(mr: MergeRequest, problems: string[], deps: FinishDeps): 
   };
 }
 
+/** Journal statuses a run ends in; finish() has already spoken for a run in one of them. */
+const TERMINAL = new Set(['done', 'blocked', 'aborted']);
+
 export async function finish(iid: number, runId: string, outcome: Outcome, deps: FinishDeps = REAL): Promise<void> {
   const L = projectConfig().labels;
   const j = readJournal(iid);
+  // Re-entered after the run already ended — run.ts's catch-all re-runs finish
+  // as blocked when the first finish threw part-way (after a merge, say). The
+  // first verdict stands: relabelling a merged ticket Needs Human, or posting a
+  // second note, would be wrong on GitLab and in the journal.
+  if (j && TERMINAL.has(j.status)) {
+    log.warn(`#${iid} finish called again on a ${j.status} run — leaving GitLab and the journal as they are`, { outcome: outcome.kind });
+    return;
+  }
   const elapsed = j ? Date.now() - j.createdAt : 0;
   if (j?.port) deps.reapPortServer(j.port);
 
