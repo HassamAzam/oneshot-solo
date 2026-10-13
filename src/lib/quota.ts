@@ -1,187 +1,26 @@
 /**
- * Subscription quota accounting.
+ * The quota park: what the conductor does when a session hits a real
+ * subscription usage limit.
  *
- * Dollars are the wrong unit here. On a Max subscription the SDK's
- * total_cost_usd is computed locally from token counts at API list rates and,
- * per Anthropic, is not relevant for billing — nothing this system does
- * produces an invoice. The real constraint is the rolling 5-hour and 7-day
- * usage windows, and those are SHARED with Hassam's own interactive sessions.
- * So the job is not "spend less money", it is "leave him enough of his window".
- *
- * Raw token counts are not comparable to each other, so everything is weighted
- * into input-token-equivalents before it is measured against a ceiling.
+ * The rolling 5-hour and 7-day windows of a Max subscription are hard external
+ * limits, shared with the operator's own interactive sessions. Once one is hit,
+ * every further session dies against the same wall until the stated reset, so
+ * the conductor parks itself in state/PAUSE-QUOTA with an expiry and stands down
+ * until it passes.
  */
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { mkdirSync } from 'node:fs';
-import { PAUSE_QUOTA, STATE, budgetConfig, envOr } from './config.js';
-import { db, logEvent } from './db.js';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { PAUSE_QUOTA, STATE } from './config.js';
 import { log } from './log.js';
 
-export interface TokenCounts {
-  input: number;
-  output: number;
-  cache_creation: number;
-  cache_read: number;
-}
-
-export function weigh(t: TokenCounts): number {
-  const w = budgetConfig().weights;
-  return Math.round(
-    t.input * w.input +
-    t.output * w.output +
-    t.cache_creation * w.cache_creation +
-    t.cache_read * w.cache_read,
-  );
-}
-
-export function recordUsage(
-  t: TokenCounts,
-  meta: { runId?: string; phase?: string; model?: string },
-): number {
-  const weighted = weigh(t);
-  db.prepare(`
-    INSERT INTO quota_usage (ts, run_id, phase, model, input, output, cache_creation, cache_read, weighted)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    Date.now(), meta.runId ?? null, meta.phase ?? null, meta.model ?? null,
-    t.input, t.output, t.cache_creation, t.cache_read, weighted,
-  );
-  return weighted;
-}
-
-function sumSince(sinceMs: number, where = '', params: unknown[] = []): number {
-  const row = db.prepare(
-    `SELECT COALESCE(SUM(weighted), 0) AS n FROM quota_usage WHERE ts >= ? ${where}`,
-  ).get(sinceMs, ...params) as { n: number };
-  return row.n;
-}
-
-export function windowUsage(): number {
-  return sumSince(Date.now() - budgetConfig().window_hours * 3_600_000);
-}
-
-export function dayUsage(): number {
-  return sumSince(Date.now() - 86_400_000);
-}
-
-export function runUsage(runId: string): number {
-  return sumSince(0, 'AND run_id = ?', [runId]);
-}
-
-export function phaseUsage(runId: string, phase: string): number {
-  return sumSince(0, 'AND run_id = ? AND phase = ?', [runId, phase]);
-}
-
-export interface QuotaVerdict {
-  allowed: boolean;
-  reason?: string;
-  detail?: Record<string, number>;
-}
-
 /**
- * Account-wide window utilisation, if the status-line harvester is installed.
- *
- * The only first-party signal for how full YOUR window is (interactive
- * sessions included) is the rate_limits object Claude Code passes to an
- * interactive status line. Headless sessions never receive it, so this system
- * cannot observe it by itself. A stale reading is treated as unknown rather
- * than trusted — the file only refreshes while an interactive session is open.
+ * How long to park when no reset time is known. Session and Opus limits reset
+ * inside a 5-hour window, so an hour and then a re-check is cheap. A weekly
+ * limit resets at a fixed per-account time that cannot be known from here, so
+ * it takes the longer default and re-checks every 6 hours rather than sleeping
+ * for a week.
  */
-export function accountWindowPct(): number | null {
-  const path = envOr('ONESHOT_RATELIMIT_SIGNAL',
-    `${process.env.HOME ?? ''}/.claude/state/ratelimit.json`);
-  if (!existsSync(path)) return null;
-  try {
-    const raw = JSON.parse(readFileSync(path, 'utf8')) as {
-      captured_at_ms?: number;
-      rate_limits?: { five_hour?: { utilization?: number } };
-    };
-    const ageMin = (Date.now() - (raw.captured_at_ms ?? 0)) / 60_000;
-    if (ageMin > budgetConfig().reserve.signal_max_age_min) return null;
-    const util = raw.rate_limits?.five_hour?.utilization;
-    return typeof util === 'number' ? util : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Checked before claiming a ticket and again at every phase boundary.
- *
- * `lap` is the zero-based attempt the phase is about to make, and it is what
- * turns the per-phase number in budgets.json into a ceiling on ONE ATTEMPT
- * rather than on the whole run. phaseUsage() sums every lap of a phase across
- * the run, so measuring that sum against a flat cap means a phase that failed
- * twice has already spent its allowance and its third attempt is refused before
- * it starts — while config/phases.json is at the same moment explicitly telling
- * it to make that attempt. A cumulative per-phase ceiling and a bounded lap
- * count are the same protection counted twice, and the shape of the failure is
- * a run that cannot retry precisely what it is configured to retry, reported as
- * a budget problem so that it reads like one. The only repair available to a
- * human is to raise the number, which buys the retry by permanently inflating
- * the ceiling for every future ticket.
- *
- * So the allowance scales with the attempt: cap * (lap + 1). The COUNT of
- * attempts is already bounded — maxLaps for cycle phases, maxRetries for retry
- * phases — so per-attempt cap times attempt cap is still a finite cumulative
- * bound, and ticket_tokens above it remains the real guard against a run that
- * cycles its way through the window.
- */
-export function checkQuota(runId?: string, phase?: string, lap = 0): QuotaVerdict {
-  if (quotaParked()) return { allowed: false, reason: 'parked after a subscription usage limit' };
-
-  const cfg = budgetConfig();
-  // budgets.enabled === false switches off every self-imposed TOKEN ceiling and
-  // leaves maxTurns/timeoutMin as the only thing bounding a phase. Deliberately
-  // placed AFTER quotaParked(): parking reacts to a real subscription limit that
-  // has already been hit, and is not ours to disable. See config/budgets.json.
-  if (cfg.enabled === false) return { allowed: true };
-
-  const win = windowUsage();
-  const day = dayUsage();
-
-  if (win >= cfg.window_tokens) {
-    return { allowed: false, reason: 'rolling window ceiling reached', detail: { win, cap: cfg.window_tokens } };
-  }
-  if (day >= cfg.day_tokens) {
-    return { allowed: false, reason: 'daily ceiling reached', detail: { day, cap: cfg.day_tokens } };
-  }
-
-  const pct = accountWindowPct();
-  if (pct !== null && pct >= cfg.reserve.pause_at_five_hour_pct) {
-    return {
-      allowed: false,
-      reason: `account 5h window ${pct}% consumed — holding the reserve`,
-      detail: { pct, reserve: cfg.reserve.pause_at_five_hour_pct },
-    };
-  }
-
-  if (runId) {
-    const used = runUsage(runId);
-    if (used >= cfg.ticket_tokens) {
-      return { allowed: false, reason: 'per-ticket ceiling reached', detail: { used, cap: cfg.ticket_tokens } };
-    }
-    if (phase) {
-      const perAttempt = cfg.phases[phase];
-      if (perAttempt !== undefined) {
-        const attempts = Math.max(1, Math.floor(lap) + 1);
-        const allowed = perAttempt * attempts;
-        const spent = phaseUsage(runId, phase);
-        if (spent >= allowed) {
-          return {
-            allowed: false,
-            reason: `phase '${phase}' ceiling reached on attempt ${attempts}`,
-            detail: { used: spent, cap: allowed, perAttempt, attempts },
-          };
-        }
-      }
-    }
-  }
-
-  return { allowed: true };
-}
-
-// ------------------------------------------------------------- rate limiting
+const PAUSE_DEFAULT_MIN = 60;
+const PAUSE_MAX_MIN = 360;
 
 /**
  * Strings Claude Code emits when a SUBSCRIPTION limit is genuinely hit. These
@@ -211,8 +50,8 @@ export function looksLikeUsageLimit(text: string): boolean {
   return LIMIT_PATTERNS.some((rx) => rx.test(text));
 }
 
-/** Parse "resets 3:45pm" into an epoch ms, clamped so a misparse can't strand us. */
-function parseResetMs(text: string): number | null {
+/** Parse "resets 3:45pm" into an epoch ms — the next such time, today or tomorrow. */
+export function parseResetMs(text: string): number | null {
   const m = /resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i.exec(text);
   if (!m) return null;
   let hour = Number(m[1]);
@@ -228,23 +67,22 @@ function parseResetMs(text: string): number | null {
 }
 
 /**
- * True while the machine's own quota park is in force.
+ * When the machine's own quota park ends (epoch ms), or null when it is not in
+ * force.
  *
  * The park is self-clearing, and that self-clearing is entirely carried by
  * `until` inside the file. So a file that cannot be parsed — truncated by a
  * crash mid-write, hand-edited, or half-synced — has no expiry, and treating it
  * as a park meant the conductor stood down FOREVER while logging one ordinary
- * "parked after a subscription usage limit" line a minute. That is the worst
- * shape a failure can take here: indistinguishable from working correctly.
+ * "parked" line a minute. That is the worst shape a failure can take here:
+ * indistinguishable from working correctly.
  *
  * A corrupt park is therefore removed and refused. Nothing is lost by doing so:
- * the weighted-token ceilings in checkQuota() are independent of this file and
- * still bound the spend, and a real limit re-parks on the next phase that hits
- * one. state/PAUSE — the human kill switch — is a different file and is never
- * touched here.
+ * a real limit re-parks on the next session that hits one. state/PAUSE — the
+ * human kill switch — is a different file and is never touched here.
  */
-export function quotaParked(): boolean {
-  if (!existsSync(PAUSE_QUOTA)) return false;
+export function quotaParked(): number | null {
+  if (!existsSync(PAUSE_QUOTA)) return null;
   try {
     const p = JSON.parse(readFileSync(PAUSE_QUOTA, 'utf8')) as { until?: number };
     if (typeof p.until !== 'number' || !Number.isFinite(p.until)) {
@@ -252,16 +90,14 @@ export function quotaParked(): boolean {
     }
     if (Date.now() >= p.until) {
       rmSync(PAUSE_QUOTA, { force: true });
-      logEvent('quota_park_cleared');
       log.ok('Quota park expired — resuming');
-      return false;
+      return null;
     }
-    return true;
+    return p.until;
   } catch (err) {
     log.error(`${PAUSE_QUOTA} is unreadable and has no expiry — removing it and resuming`, {
       error: (err as Error).message,
     });
-    logEvent('quota_park_corrupt', { error: (err as Error).message });
     try {
       rmSync(PAUSE_QUOTA, { force: true });
     } catch (rmErr) {
@@ -269,30 +105,34 @@ export function quotaParked(): boolean {
         error: (rmErr as Error).message,
       });
     }
-    return false;
+    return null;
   }
 }
 
 /**
- * Park after a real usage limit. Written to its own file, never state/PAUSE:
- * nothing automatic may ever create or clear the human kill switch.
+ * Park after a real usage limit: until `resetMs` when the caller was told it,
+ * else the reset time `reason` states, else a default. A `resetMs` that is not
+ * in the future is ignored rather than trusted — a park that has already
+ * expired would send the next session straight back into the wall.
+ *
+ * Written to its own file, never state/PAUSE: nothing automatic may ever create
+ * or clear the human kill switch.
  */
-export function parkForQuota(text: string): void {
-  const cfg = budgetConfig();
-  const parsed = parseResetMs(text);
-  const weekly = /weekly/i.test(text);
-  const fallbackMin = weekly ? cfg.pause_defaults.weekly_minutes : cfg.pause_defaults.session_minutes;
-  const until = parsed ?? Date.now() + fallbackMin * 60_000;
+export function parkForQuota(reason: string, resetMs?: number): void {
+  const now = Date.now();
+  const told = resetMs !== undefined && Number.isFinite(resetMs) && resetMs > now ? resetMs : null;
+  const parsed = told ?? parseResetMs(reason);
+  const fallbackMin = /weekly/i.test(reason) ? PAUSE_MAX_MIN : PAUSE_DEFAULT_MIN;
+  const until = parsed ?? now + fallbackMin * 60_000;
   // Clamp to 7 days so a mis-parsed reset time cannot strand the system.
-  const clamped = Math.min(until, Date.now() + 7 * 86_400_000);
+  const clamped = Math.min(until, now + 7 * 86_400_000);
 
   mkdirSync(STATE, { recursive: true });
   writeFileSync(PAUSE_QUOTA, JSON.stringify({
-    reason: 'subscription usage limit',
+    reason: reason.slice(0, 300) || 'subscription usage limit',
     parsed_reset: parsed,
     until: clamped,
-    at: Date.now(),
+    at: now,
   }, null, 2));
-  logEvent('quota_park', { until: clamped, parsed: parsed !== null });
   log.error(`Subscription limit hit — parked until ${new Date(clamped).toLocaleTimeString()}`);
 }

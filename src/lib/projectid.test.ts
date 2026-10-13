@@ -14,8 +14,8 @@ import assert from 'node:assert/strict';
 import { getIssue, projectUrl, resolvedProjectId } from './gitlab.js';
 import { collectTicketDocs } from './ticketdocs.js';
 
-// Set rather than inherited, so this machine's .env cannot change the answer.
-process.env.GITLAB_READ_TOKEN = 'test-read-token';
+// Set rather than inherited, so this machine's .env, token file or keychain cannot change the answer.
+process.env.ONESHOT_GITLAB_TOKEN = 'test-token';
 
 const API = 'https://gitlab.example.com/api/v4';
 const SECRET = '275920f75d842b9067ea1e8f0a621a45';

@@ -1,29 +1,29 @@
 /**
- * The documents a ticket points at, made readable before `research` starts.
+ * The documents a ticket points at, made readable before the session starts.
  *
  * A ticket's requirements do not all live in its text. A spec is attached as a
  * .docx, the expected figures as an .xlsx, the flow as a PDF — and a markdown
- * link to `/uploads/…` is all a phase sees of them. The upload sits behind the
+ * link to `/uploads/…` is all a session sees of them. The upload sits behind the
  * project's auth, so a session cannot simply fetch it, and it would have to
  * choose to. So the conductor does it: every document attached in the
  * description or a comment is downloaded into the run dir, turned into text
  * where the Read tool cannot open the format itself, and listed in the prompt
  * by local path.
  *
- * Videos are deliberately left out — a phase cannot watch one, and downloading
+ * Videos are deliberately left out — a session cannot watch one, and downloading
  * hundreds of megabytes to list a path nobody can read is pure cost.
  *
  * Best effort throughout. A document that fails to download or convert is still
- * listed, with the reason, so the phase can name it as an unknown rather than
+ * listed, with the reason, so the session can name it as an unknown rather than
  * never learning it existed. Nothing here fails a run.
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { extname, join } from 'node:path';
-import { projectConfig, runDir } from './config.js';
+import { gitlabRepo, runDir } from './config.js';
 import { downloadUpload, resolvedProjectId } from './gitlab.js';
 import { log } from './log.js';
-import type { TicketDoc } from '../phases/types.js';
+import type { TicketDoc } from './ticket.js';
 
 /** Opened directly by the Read tool. Images count: a screenshot is ticket context. */
 const READABLE = new Set([
@@ -121,8 +121,8 @@ function toText(src: string, ext: string): string {
 
 /**
  * Download and convert every document the ticket's text links to. Cached by
- * upload secret in the run dir, so the per-tick re-read of a `--follow` or
- * parked run costs one existence check per document, not a download.
+ * upload secret in the run dir, so reading the ticket again into the same run
+ * dir (a resume) costs one existence check per document, not a download.
  */
 export async function collectTicketDocs(
   iid: number, sources: Array<{ where: string; body: string }>,
@@ -134,7 +134,7 @@ export async function collectTicketDocs(
   if (byId && id === null) {
     log.warn(`#${iid}: could not ask GitLab for the project id; /-/project/<id>/ upload links are skipped`);
   }
-  const project = { url: projectConfig().gitlab.webUrl, id };
+  const project = { url: gitlabRepo().webUrl, id };
 
   const seen = new Set<string>();
   const links: UploadLink[] = [];
