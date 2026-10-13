@@ -20,7 +20,10 @@ test('hooksFor registers the six core guards and the erp pack from its manifest'
   const pre = h.PreToolUse!.map((m) => m.matcher ?? '*');
   assert.ok(pre.includes('^Bash$'));                                   // git-guard
   assert.ok(pre.includes('^Write$'));                                  // churn-guard
-  assert.ok(pre.includes('^mcp__gitlab__(create|update)_merge_request$'));
+  // mr-gate sees every write the session may make on GitLab, so it can hold each one to the project.
+  const mr = new RegExp(pre.find((m) => m.includes('merge_request'))!);
+  for (const t of ['create_merge_request', 'update_merge_request', 'create_merge_request_note', 'upload_markdown']) assert.ok(mr.test(`mcp__gitlab__${t}`), t);
+  assert.ok(!mr.test('mcp__gitlab__get_merge_request'));
   assert.equal(h.PreToolUse![0]!.matcher, undefined);                  // pause-check first, unmatched
   assert.ok(h.PostToolUse!.some((m) => m.timeout === 60));             // py-lint from the pack
   assert.equal(h.SessionStart!.length, 2);                             // traps-brief, repro-conditions

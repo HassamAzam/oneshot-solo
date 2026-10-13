@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTicketResult, isBlocked, RESULT_SCHEMA, DENIED_TOOLS } from './types.js';
+import { parseTicketResult, isBlocked, RESULT_SCHEMA, DENIED_TOOLS, SERVER_DENIED_TOOLS_REGEX } from './types.js';
 
 test('parseTicketResult accepts the full shape and tolerates missing optionals', () => {
   const r = parseTicketResult({ summary: 'did it', mrIid: 12, mrUrl: 'https://g/!12', cases: [{ id: 'TC1', title: 'happy', verdict: 'pass' }], assumptions: ['x'] });
@@ -41,4 +41,21 @@ test('DENIED_TOOLS covers every write tool the installed GitLab MCP server expos
     .filter((n) => !registry.advertisesReadOnly(n) && !allowed.includes(n))
     .filter((n) => !DENIED_TOOLS.includes(`mcp__gitlab__${n}`));
   assert.deepEqual(open, [], 'write tools the session could call');
+});
+
+test('the server-side deny regex, with modify mode, blocks every denied GitLab tool and nothing the session may call', async () => {
+  const base = new URL('../../node_modules/@zereight/mcp-gitlab/build/tools/', import.meta.url).href;
+  const registry = await import(`${base}registry.js`) as { allTools: Array<{ name: string }>; deleteTools: Set<string> };
+  const { compileDeniedToolsRegex } = await import(`${base}denied-regex.js`) as {
+    compileDeniedToolsRegex(p: string): { regex?: RegExp; error?: string };
+  };
+  // The server ignores, with only a log line, a pattern it will not compile — over 200 chars, say.
+  const compiled = compileDeniedToolsRegex(SERVER_DENIED_TOOLS_REGEX);
+  assert.equal(compiled.error, undefined);
+  const rx = compiled.regex!;
+  const denied = DENIED_TOOLS.filter((t) => t.startsWith('mcp__gitlab__')).map((t) => t.slice('mcp__gitlab__'.length));
+  const open = denied.filter((n) => !rx.test(n) && !registry.deleteTools.has(n));
+  assert.deepEqual(open, [], 'denied tools the server would still expose');
+  const overreach = registry.allTools.map((t) => t.name).filter((n) => !denied.includes(n) && rx.test(n));
+  assert.deepEqual(overreach, [], 'tools the regex would take from the session');
 });

@@ -165,7 +165,8 @@ export function packManifest(name: string): PackHook[] {
 const WRITE_TOOLS = '^(Write|Edit|NotebookEdit)$';
 const WRITE = '^Write$';
 const BASH = '^Bash$';
-const MR_TOOLS = '^mcp__gitlab__(create|update)_merge_request$';
+/** Every GitLab write the session is allowed: mr-gate holds each to the run's project. */
+const MR_TOOLS = '^mcp__gitlab__(create_merge_request|update_merge_request|create_merge_request_note|upload_markdown)$';
 const READ_OR_BASH = '^(Read|NotebookRead|Grep|Bash)$';
 
 /**

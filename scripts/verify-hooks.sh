@@ -239,16 +239,60 @@ mr_payload() {
     printf '{"tool_name":"%s","tool_input":%s}' "$1" "$2"
 }
 
+# The run's project, as sessionEnv hands it over; the base is config/project.json's.
+export ONESHOT_PROJECT_PATH="acme/erp"
+export ONESHOT_PROJECT_ID="304"
+MR_BASE="$("$NODE" -e 'console.log(require(process.argv[1]).branches.base)' "$ROOT/config/project.json")"
+CLOSES='Does a thing.
+
+[closes https://gitlab.example.com/g/p/-/issues/1]'
+# create_payload <title> <source> <target> <description> [project_id] — JSON built by node,
+# not by nested shell quoting (macOS bash 3.2 brace-expands inside "$(… "{…}")").
+create_payload() {
+    "$NODE" -e '
+const [title, source_branch, target_branch, description, project] = process.argv.slice(1);
+const input = { title, source_branch, target_branch, description };
+if (project) input.project_id = /^\d+$/.test(project) ? Number(project) : project;
+process.stdout.write(JSON.stringify({ tool_name: "mcp__gitlab__create_merge_request", tool_input: input }));' "$@"
+}
+
 expect_deny  "conventional-commit prefix in title" mr-gate.cjs \
-    "$(mr_payload mcp__gitlab__create_merge_request '{"title":"chore: remove unused celery task","description":"[closes https://gitlab.example.com/g/p/-/issues/1]"}')"
+    "$(create_payload 'chore: remove unused celery task' "$ONESHOT_BRANCH" "$MR_BASE" "$CLOSES")"
 expect_deny  "create with no closes line"          mr-gate.cjs \
-    "$(mr_payload mcp__gitlab__create_merge_request '{"title":"Remove Unused Celery Task","description":"Does a thing."}')"
+    "$(create_payload 'Remove Unused Celery Task' "$ONESHOT_BRANCH" "$MR_BASE" 'Does a thing.')"
 expect_allow "plain title plus closes line"        mr-gate.cjs \
-    "$(mr_payload mcp__gitlab__create_merge_request '{"title":"Remove Unused Celery Task","description":"Does a thing.\n\n[closes https://gitlab.example.com/g/p/-/issues/1]"}')"
+    "$(create_payload 'Remove Unused Celery Task' "$ONESHOT_BRANCH" "$MR_BASE" "$CLOSES")"
 expect_allow "update that touches neither field"   mr-gate.cjs \
     "$(mr_payload mcp__gitlab__update_merge_request '{"labels":"ready"}')"
 expect_deny  "update sending a closes-less body"   mr-gate.cjs \
     "$(mr_payload mcp__gitlab__update_merge_request '{"description":"Rewritten body."}')"
+# Branches: the run's own branch, into the base — nothing else is this run's MR.
+expect_deny  "create from another source branch"   mr-gate.cjs \
+    "$(create_payload 'Remove Unused Celery Task' dev "$MR_BASE" "$CLOSES")"
+expect_deny  "create into another target branch"   mr-gate.cjs \
+    "$(create_payload 'Remove Unused Celery Task' "$ONESHOT_BRANCH" master "$CLOSES")"
+expect_deny  "update retargeting the MR"           mr-gate.cjs \
+    "$(mr_payload mcp__gitlab__update_merge_request '{"merge_request_iid":"9","target_branch":"master"}')"
+# Project: by path, URL-encoded path or numeric id — this run's, and no other.
+expect_allow "create on this project by path"      mr-gate.cjs \
+    "$(create_payload 'Remove Unused Celery Task' "$ONESHOT_BRANCH" "$MR_BASE" "$CLOSES" acme/erp)"
+expect_allow "create on this project by numeric id" mr-gate.cjs \
+    "$(create_payload 'Remove Unused Celery Task' "$ONESHOT_BRANCH" "$MR_BASE" "$CLOSES" 304)"
+expect_allow "note on this project, encoded path"  mr-gate.cjs \
+    "$(mr_payload mcp__gitlab__create_merge_request_note '{"project_id":"acme%2Ferp","merge_request_iid":"9","body":"Evidence attached."}')"
+expect_deny  "create on another project"           mr-gate.cjs \
+    "$(create_payload 'Remove Unused Celery Task' "$ONESHOT_BRANCH" "$MR_BASE" "$CLOSES" acme/payroll)"
+expect_deny  "update on another project's MR"      mr-gate.cjs \
+    "$(mr_payload mcp__gitlab__update_merge_request '{"project_id":"999","merge_request_iid":"9","labels":"ready"}')"
+expect_deny  "note on another project's MR"        mr-gate.cjs \
+    "$(mr_payload mcp__gitlab__create_merge_request_note '{"project_id":"other/repo","merge_request_iid":"1","body":"hi"}')"
+expect_deny  "upload to another project"           mr-gate.cjs \
+    "$(mr_payload mcp__gitlab__upload_markdown '{"project_id":"other/repo","file_path":"screens/01.png"}')"
+expect_allow "upload to this project"              mr-gate.cjs \
+    "$(mr_payload mcp__gitlab__upload_markdown '{"project_id":"304","file_path":"screens/01.png"}')"
+ONESHOT_PROJECT_PATH="" ONESHOT_PROJECT_ID="" expect_allow "no project in the env: allowed and logged" mr-gate.cjs \
+    "$(mr_payload mcp__gitlab__create_merge_request_note '{"project_id":"other/repo","merge_request_iid":"1","body":"hi"}')"
+unset ONESHOT_PROJECT_PATH ONESHOT_PROJECT_ID
 
 echo
 echo "secret-guard"
@@ -288,8 +332,21 @@ expect_allow "cat .env.example by bare name"   secret-guard.cjs \
     "$(printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"cat .env.example"}}' "$ROOT")"
 expect_allow "cat .env.example by absolute path" secret-guard.cjs \
     "$(printf '{"tool_name":"Bash","cwd":"/tmp","tool_input":{"command":"cat %s/.env.example"}}' "$ROOT")"
-expect_allow "cat .env.local and .env.sample"  secret-guard.cjs \
-    "$(printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"cat .env.local .env.sample"}}' "$ROOT")"
+expect_allow "the work repo's .env.local and .env.sample" secret-guard.cjs \
+    "$(printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"cat .env.local .env.sample"}}' "$ONESHOT_WORKTREE")"
+# Every other .env.* under ONESHOT_HOME is a copy of the secrets: setup's .env.bak-<stamp> backups.
+expect_deny  "Read of a .env.bak backup"        secret-guard.cjs \
+    "$(printf '{"tool_name":"Read","tool_input":{"file_path":"%s/.env.bak-20260101-000000"}}' "$ROOT")"
+expect_deny  "cat of a .env.bak backup"         secret-guard.cjs \
+    "$(printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"cat .env.bak-20260101-000000"}}' "$ROOT")"
+expect_deny  "cat \$ONESHOT_HOME/.env.bak-*"     secret-guard.cjs \
+    '{"tool_name":"Bash","cwd":"/tmp","tool_input":{"command":"cat $ONESHOT_HOME/.env.bak-*"}}'
+expect_deny  "head of .env* by glob"            secret-guard.cjs \
+    "$(printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"head -5 .env*"}}' "$ROOT")"
+expect_deny  "Read of this repo's .env.local"   secret-guard.cjs \
+    "$(printf '{"tool_name":"Read","tool_input":{"file_path":"%s/.env.local"}}' "$ROOT")"
+expect_allow "Read of .env.example"             secret-guard.cjs \
+    "$(printf '{"tool_name":"Read","tool_input":{"file_path":"%s/.env.example"}}' "$ROOT")"
 expect_allow "redirect out of .env.example"    secret-guard.cjs \
     "$(printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"grep -c = < .env.example > /tmp/n"}}' "$ROOT")"
 
@@ -706,6 +763,13 @@ echo "secret-guard (desk token, claude.json)"
 expect_deny  "read the desk token file"  secret-guard.cjs '{"tool_name":"Read","tool_input":{"file_path":"'"$HOME"'/.config/oneshot/gitlab-token"}}'
 expect_deny  "cat ~/.claude.json"        secret-guard.cjs "$(bash_payload 'cat ~/.claude.json')"
 expect_allow "read a worktree file"      secret-guard.cjs '{"tool_name":"Read","tool_input":{"file_path":"/tmp/oneshot-verify-wt/README.md"}}'
+# The token's other homes, as src/lib/token.ts reads them: glab's config and the macOS keychain.
+expect_deny  "cat ~/.config/glab-cli/config.yml" secret-guard.cjs "$(bash_payload 'cat ~/.config/glab-cli/config.yml')"
+expect_deny  "Read glab's config.yml"    secret-guard.cjs '{"tool_name":"Read","tool_input":{"file_path":"'"$HOME"'/.config/glab-cli/config.yml"}}'
+expect_allow "an app's own config.yml"   secret-guard.cjs "$(bash_payload 'cat /tmp/oneshot-verify-wt/config.yml')"
+expect_deny  "security find-generic-password" secret-guard.cjs "$(bash_payload 'security find-generic-password -s oneshot-gitlab -w')"
+expect_deny  "keychain read via a full path" secret-guard.cjs "$(bash_payload 'T=$(/usr/bin/security -q find-generic-password -s oneshot-gitlab -w) && echo ok')"
+expect_allow "grepping the source for the keychain service" secret-guard.cjs "$(bash_payload 'grep -rn oneshot-gitlab src/lib/token.ts')"
 
 echo
 echo "traps-brief"

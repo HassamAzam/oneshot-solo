@@ -12,7 +12,7 @@
 import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
 import { PROJECT_TARGET, appPort, projectConfig, sessionModel } from '../lib/config.js';
-import { getIssue, issueUrl } from '../lib/gitlab.js';
+import { getIssue, issueUrl, resolvedProjectId } from '../lib/gitlab.js';
 import {
   archiveRun, ensureRunDirs, pidAlive, readJournal, recordPhase, updateJournal, writeJournal, type RunJournal,
 } from '../lib/journal.js';
@@ -259,8 +259,10 @@ export async function runTicket(iid: number, opts: { signal?: AbortSignal; force
     // Compiles while the model plans; a failure here is a slower run, not a broken one.
     startRunApp({ iid, runId, worktree: lease.worktree, port });
 
+    // Asked once, for mr-gate and the GitLab server's allowlist; the path alone holds both when GitLab cannot answer.
+    const projectId = (await resolvedProjectId()) ?? undefined;
     const out = await attemptLoop(
-      { iid, runId, ticket, worktree: lease.worktree, branch, port, signal: opts.signal, resume: resuming ? lastSessionId(existing) : undefined },
+      { iid, runId, ticket, worktree: lease.worktree, branch, port, signal: opts.signal, resume: resuming ? lastSessionId(existing) : undefined, projectId },
       runSession,
       resuming ? existing.phases.length : 0,
     );

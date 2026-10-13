@@ -7,6 +7,7 @@ import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifySessionEnd, foldFrame, newFrameFold, shouldPark, sessionEnv, queryOptions, sessionMcpServers, NO_STRUCTURED_OUTPUT } from './session.js';
+import { SERVER_DENIED_TOOLS_REGEX } from './types.js';
 
 process.env.ONESHOT_GITLAB_TOKEN = 'glpat-test';   // resolveToken() stops here: no desk file, no keychain lookup
 
@@ -121,9 +122,27 @@ test('sessionMcpServers: one `gitlab` server through the shim, BASE_ENV undernea
   assert.equal(gl.env.GITLAB_PERSONAL_ACCESS_TOKEN, 'glpat-mcp-only');
   assert.equal(gl.env.GITLAB_API_URL, 'https://gitlab.example.com/api/v4');
   assert.deepEqual(gl.env.GITLAB_TOOLS!.split(','), ['create_merge_request_note', 'upload_markdown']);
-  assert.equal(gl.env.GITLAB_PERMISSION_MODE, 'full');
+  assert.equal(gl.env.GITLAB_PERMISSION_MODE, 'modify');
+  assert.equal(gl.env.GITLAB_DENIED_TOOLS_REGEX, SERVER_DENIED_TOOLS_REGEX);
+  // No numeric id known: the server is still held to the project by its path.
+  assert.equal(gl.env.GITLAB_ALLOWED_PROJECT_IDS, 'acme/erp');
+  assert.equal(gl.env.GITLAB_PROJECT_ID, 'acme/erp');
+  assert.equal(gl.env.ENABLE_STRICT_PROJECT_SCOPE, 'true');
+  const scoped = (sessionMcpServers(7, 304) as Record<string, Stdio>).gitlab!;
+  assert.equal(scoped.env.GITLAB_ALLOWED_PROJECT_IDS, '304,acme/erp');
+  assert.equal(scoped.env.GITLAB_PROJECT_ID, '304');
   const s = sessionEnv({ iid: 7, runId: 'r-7', lap: 0, ticket: { iid: 7, title: 't', description: '', labels: [], notes: [], documents: [], externalDocs: [] }, worktree: '/wt', branch: 'b', port: 8000, previousAttempt: false });
   assert.ok(!Object.values(s).includes('glpat-mcp-only'), 'the GitLab token never reaches the session env');
+});
+
+test('sessionEnv names the project for mr-gate: its path always, its numeric id when the conductor resolved one', () => {
+  const input = { iid: 7, runId: 'r-7', lap: 0, ticket: { iid: 7, title: 't', description: '', labels: [], notes: [], documents: [], externalDocs: [] }, worktree: '/wt', branch: 'b', port: 8000, previousAttempt: false };
+  const unknown = sessionEnv(input);
+  assert.equal(unknown.ONESHOT_PROJECT_PATH, 'acme/erp');
+  assert.equal(unknown.ONESHOT_PROJECT_ID, '', 'blank, so a retired ONESHOT_PROJECT_ID in .env cannot stand in for it');
+  // ONESHOT_PROJECT is a retired selector that app.cjs judges against the project NAME; a path there would refuse every bring-up.
+  assert.equal(unknown.ONESHOT_PROJECT, '');
+  assert.equal(sessionEnv({ ...input, projectId: 304 }).ONESHOT_PROJECT_ID, '304');
 });
 
 /**
@@ -133,7 +152,7 @@ test('sessionMcpServers: one `gitlab` server through the shim, BASE_ENV undernea
  * records the multipart POST; the file's bytes arriving there is the proof that
  * the server ran with ONESHOT_ARTIFACTS as its cwd.
  */
-test('the gitlab shim runs the server from ONESHOT_ARTIFACTS, so upload_markdown takes a relative path', async () => {
+test('the gitlab shim runs the server from ONESHOT_ARTIFACTS, so upload_markdown takes a relative path — on this project only', async () => {
   const artifacts = join(mkdtempSync(join(tmpdir(), 'solo-mcp-')), 'artifacts');   // not created: the shim must create it
   const uploads: string[] = [];
   const gitlab = createServer((req, res) => {
@@ -151,7 +170,7 @@ test('the gitlab shim runs the server from ONESHOT_ARTIFACTS, so upload_markdown
   const port = (gitlab.address() as { port: number }).port;
 
   process.env.ONESHOT_GITLAB_TOKEN = 'glpat-test';
-  const gl = (sessionMcpServers(7) as Record<string, Stdio>).gitlab!;
+  const gl = (sessionMcpServers(7, 1) as Record<string, Stdio>).gitlab!;
   const env = { ...gl.env, ONESHOT_ARTIFACTS: artifacts, GITLAB_API_URL: `http://127.0.0.1:${port}/api/v4`, GITLAB_DISABLE_VERSION_CHECK: 'true' };
   const child = spawn(gl.command, gl.args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
   let stderr = '';
@@ -179,6 +198,11 @@ test('the gitlab shim runs the server from ONESHOT_ARTIFACTS, so upload_markdown
     const tools = ((await call('tools/list', {})).result as { tools: Array<{ name: string }> }).tools.map((t) => t.name);
     assert.ok(tools.includes('upload_markdown'), 'GITLAB_TOOLS adds upload_markdown to the default toolset');
     assert.ok(tools.includes('create_merge_request_note'), 'GITLAB_TOOLS adds create_merge_request_note to the default toolset');
+    for (const t of ['create_merge_request', 'update_merge_request']) assert.ok(tools.includes(t), `${t} stays listed`);
+    // The server's own limits: the deny regex and modify mode, whatever the SDK does.
+    for (const t of ['merge_merge_request', 'create_issue_note', 'push_files', 'execute_graphql', 'delete_branch']) {
+      assert.ok(!tools.includes(t), `${t} must not be listed`);
+    }
 
     mkdirSync(join(artifacts, 'screens'), { recursive: true });
     writeFileSync(join(artifacts, 'screens', '01-before.png'), 'PNG-BYTES-FROM-ARTIFACTS');
@@ -187,6 +211,12 @@ test('the gitlab shim runs the server from ONESHOT_ARTIFACTS, so upload_markdown
     assert.notEqual((res.result as { isError?: boolean }).isError, true, JSON.stringify(res.result));
     assert.equal(uploads.length, 1);
     assert.ok(uploads[0]!.includes('PNG-BYTES-FROM-ARTIFACTS'));
+
+    // Another project the token could reach is refused by the server before any request.
+    const other = await call('tools/call', { name: 'upload_markdown', arguments: { project_id: '2', file_path: 'screens/01-before.png' } });
+    assert.equal((other.result as { isError?: boolean }).isError, true);
+    assert.match(JSON.stringify(other.result), /not in the allowed project list/);
+    assert.equal(uploads.length, 1);
   } finally {
     child.kill();
     gitlab.close();

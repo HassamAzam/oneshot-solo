@@ -44,6 +44,33 @@ const { spawnSync } = require('child_process');
 const ONESHOT_HOME = process.env.ONESHOT_HOME || path.resolve(__dirname, '..');
 try { require('dotenv').config({ path: path.join(ONESHOT_HOME, '.env'), override: false }); } catch { /* optional */ }
 
+/**
+ * Credentials this script never uses and the processes it starts must never hold.
+ *
+ * The .env just loaded carries the desk's GitLab token and the managed test login, and
+ * a conductor's environment can carry Anthropic or Claude Code credentials. Django and
+ * webpack are long-lived, they run code the session edits, and on macOS a process of
+ * the same user can read another's environment (`ps eww <pid>`). So they are taken out
+ * of THIS process's environment, right here, before anything is spawned: every child —
+ * this file's own manage.py runs, and the runserver and webpack harness.cjs starts with
+ * `...process.env` — inherits the scrubbed copy. The harness's own login (run by a
+ * session, never by this script) reads ONESHOT_TEST_LOGIN from the session's env.
+ */
+const CREDENTIAL_KEYS = new Set([
+  'GITLAB_TOKEN', 'ONESHOT_GITLAB_TOKEN', 'ONELOOP_GITLAB_TOKEN', 'GITLAB_PERSONAL_ACCESS_TOKEN',
+  'ONESHOT_TEST_LOGIN', 'ONELOOP_TEST_LOGIN',
+]);
+const isCredentialKey = (k) => CREDENTIAL_KEYS.has(k) || k.startsWith('ANTHROPIC_') || k.startsWith('CLAUDE_CODE_');
+
+/** A copy of `env` without any credential key. */
+function scrubEnv(env) {
+  const out = {};
+  for (const [k, v] of Object.entries(env)) if (!isCredentialKey(k)) out[k] = v;
+  return out;
+}
+
+for (const k of Object.keys(process.env)) if (isCredentialKey(k)) delete process.env[k];
+
 const H = require(path.join(ONESHOT_HOME, 'skills/local-browser-verify/scripts/harness.cjs'));
 
 /* ------------------------------------------------------------------ config */
@@ -1156,7 +1183,7 @@ Environment: GITLAB_REPO_URL (the project; WORK_REPO and WT_ROOT default from it
  * to the TypeScript side: the claim that the two agree is only worth something checked.
  */
 module.exports = {
-  ensure, warm, discover, gc, down, resolveRef, checkoutError, cutFromOurClone,
+  ensure, warm, discover, gc, down, resolveRef, checkoutError, cutFromOurClone, scrubEnv,
   config: { name: TARGET.name, WORK_REPO, SEED_FROM, WT_ROOT, BASE_BRANCH, error: CONFIG_ERROR },
 };
 if (require.main === module) main();

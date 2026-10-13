@@ -21,7 +21,7 @@ import { query, type McpStdioServerConfig, type Options, type SDKMessage } from 
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
-  BASE_ENV, DRY_RUN, ROOT, artifactDir, envOr, gitlabRepo, projectSessionEnv,
+  BASE_ENV, DRY_RUN, ROOT, artifactDir, envOr, gitlabRepo, projectSessionEnv, repoIdentity,
   sessionCaps, sessionModel, superpowersPath,
 } from '../lib/config.js';
 import { phaseEnv } from '../lib/ids.js';
@@ -31,7 +31,7 @@ import { accountActionRequired } from '../lib/accountgate.js';
 import { resolveToken } from '../lib/token.js';
 import { log } from '../lib/log.js';
 import type { Ticket } from '../lib/ticket.js';
-import { DENIED_TOOLS, RESULT_SCHEMA, parseTicketResult, type TicketResult } from './types.js';
+import { DENIED_TOOLS, RESULT_SCHEMA, SERVER_DENIED_TOOLS_REGEX, parseTicketResult, type TicketResult } from './types.js';
 import { hooksFor } from './hooks.js';
 import { systemAppend, ticketPrompt, type PromptContext } from './prompt.js';
 
@@ -39,6 +39,8 @@ export interface SessionInput {
   iid: number; runId: string; lap: number; ticket: Ticket; worktree: string; branch: string; port: number;
   /** The previous attempt's session id: this attempt continues that conversation. */
   resume?: string;
+  /** The project's numeric id, when the conductor could ask GitLab for it (resolvedProjectId). */
+  projectId?: number;
   previousAttempt: boolean;
   /**
    * External cancellation, kept from runPhase. An abort through it is the
@@ -139,6 +141,13 @@ const SUPERPOWERS_INTRO: string | undefined = (() => {
  * ONESHOT_PHASE is the constant 'ticket' — hooks/_common.cjs exits 0 without
  * it, so leaving it out silently disables every guard. No GitLab token: that
  * reaches only the MCP server (sessionMcpServers).
+ *
+ * ONESHOT_PROJECT_PATH and ONESHOT_PROJECT_ID are what mr-gate holds every
+ * GitLab write to. Not ONESHOT_PROJECT: that is a retired selector app.cjs
+ * still judges against the project's NAME, so a path there would make every
+ * in-session `app.cjs ensure` refuse. The id stays the '' projectSessionEnv
+ * gives it when GitLab could not be asked, so a stale one in .env cannot
+ * stand in for it.
  */
 export function sessionEnv(input: SessionInput): Record<string, string> {
   return {
@@ -150,6 +159,8 @@ export function sessionEnv(input: SessionInput): Record<string, string> {
     ),
     ONESHOT_ARTIFACTS: artifactDir(input.iid),
     ONESHOT_TICKET_LABELS: input.ticket.labels.join(','),
+    ...(repoIdentity().repo ? { ONESHOT_PROJECT_PATH: repoIdentity().repo!.project } : {}),
+    ...(input.projectId ? { ONESHOT_PROJECT_ID: String(input.projectId) } : {}),
     // Playwright lives in THIS repo's node_modules; the worktree's resolves
     // into the seed, which does not carry it. NODE_PATH is Node's fallback.
     NODE_PATH: join(ROOT, 'node_modules'),
@@ -176,10 +187,19 @@ export function sessionEnv(input: SessionInput): Record<string, string> {
  * spawn while the SDK still reported it `connected`. GITLAB_TOOLS adds the two
  * MR write tools the default toolset leaves out. No token, no server: one that
  * cannot authenticate would only exit at spawn.
+ *
+ * The server's own limits, so it does not depend on the SDK's disallowedTools
+ * alone: `modify` blocks every delete and teardown tool (create/update MR, the
+ * MR note and upload_markdown stay), SERVER_DENIED_TOOLS_REGEX takes the rest
+ * of DENIED_TOOLS, and the project allowlist with strict scope holds every
+ * call to this project — the token itself reaches every project the operator
+ * can. The path is always known; the numeric id joins it when the conductor
+ * resolved one.
  */
-export function sessionMcpServers(iid: number): Record<string, McpStdioServerConfig> {
+export function sessionMcpServers(iid: number, projectId?: number): Record<string, McpStdioServerConfig> {
   const token = resolveToken().token;
   if (!token) return {};
+  const path = gitlabRepo().project;
   return {
     gitlab: {
       type: 'stdio',
@@ -193,7 +213,11 @@ export function sessionMcpServers(iid: number): Record<string, McpStdioServerCon
         // conductor's own calls can only ever reach the same instance.
         GITLAB_API_URL: gitlabRepo().apiUrl,
         GITLAB_TOOLS: 'create_merge_request_note,upload_markdown',
-        GITLAB_PERMISSION_MODE: 'full',
+        GITLAB_PERMISSION_MODE: 'modify',
+        GITLAB_DENIED_TOOLS_REGEX: SERVER_DENIED_TOOLS_REGEX,
+        GITLAB_PROJECT_ID: projectId ? String(projectId) : path,
+        GITLAB_ALLOWED_PROJECT_IDS: [projectId ? String(projectId) : '', path].filter(Boolean).join(','),
+        ENABLE_STRICT_PROJECT_SCOPE: 'true',
       },
     },
   };
@@ -220,7 +244,7 @@ export function queryOptions(input: SessionInput, io: SessionIO): Options {
     settingSources: ['project'],
     plugins: sp ? [{ type: 'local', path: sp }] : [],
     hooks: hooksFor(io.env) as Options['hooks'],
-    mcpServers: sessionMcpServers(input.iid),
+    mcpServers: sessionMcpServers(input.iid, input.projectId),
     disallowedTools: DENIED_TOOLS,
     permissionMode: 'bypassPermissions',
     // Required alongside bypassPermissions. The hook layer, not the permission

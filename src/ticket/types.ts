@@ -111,3 +111,23 @@ export const DENIED_TOOLS: string[] = [
   // a query language that can also mutate
   ...gitlab('execute_graphql'),
 ];
+
+/**
+ * DENIED_TOOLS again, on the GitLab server's side, as GITLAB_DENIED_TOOLS_REGEX:
+ * a denied tool is then not listed, not callable, and not re-added by
+ * `discover_tools`, whatever the SDK's disallowedTools does. Together with
+ * GITLAB_PERMISSION_MODE=modify, which blocks every delete and teardown tool,
+ * it covers the whole gitlab half of DENIED_TOOLS.
+ *
+ * Written by hand rather than joined from the list: the server ignores, with
+ * only a log line, a pattern over 200 characters or one with a lookahead, and
+ * the joined list is 2,700. So it names verb families — every tool whose name
+ * starts with one of these is denied — and spells out the create_/update_
+ * names around the three the session keeps (create_merge_request,
+ * create_merge_request_note, update_merge_request). types.test.ts checks it
+ * against the installed server: it compiles there, it plus modify mode blocks
+ * every denied tool, and it takes nothing else.
+ */
+export const SERVER_DENIED_TOOLS_REGEX =
+  '^((un|)approve|bulk|con(firm|vert)|dismiss|edit|execute|fork|m(ark|erge|ove)|p|re(solve|try)|t(ake|rigger)'
+  + '|create_([a-ln-z]|mi|merge_request_([tde]|note_))|update_([a-ln-z]|merge_request_))';

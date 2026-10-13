@@ -2,36 +2,43 @@
 'use strict';
 /**
  * PreToolUse: keep this machine's credential files out of a session — this
- * repo's .env, the desk's GitLab token file (~/.config/oneshot/gitlab-token)
- * and Claude Code's own ~/.claude.json.
+ * repo's .env and every .env.* copy of it (setup's .env.bak-<stamp> backups),
+ * the desk's GitLab token file (~/.config/oneshot/gitlab-token), glab's
+ * config (~/.config/glab-cli/config.yml), the macOS keychain item the token
+ * may live in, and Claude Code's own ~/.claude.json.
  *
- * WHAT THIS IS NOT PROTECTING AGAINST. `GITLAB_TOKEN` never reaches a phase.
- * The session environment in src/lib/config.ts is a WHITELIST — PATH, HOME,
- * LANG, ONESHOT_HOME and the identity variables — so `echo $GITLAB_TOKEN`
- * prints an empty line, and the token travels only into the MCP server's own
- * subprocess. The skills' "never print GITLAB_TOKEN" rule is already true by
- * construction for the environment.
+ * WHAT THIS IS NOT PROTECTING AGAINST. `GITLAB_TOKEN` is not in anything the
+ * session starts or inherits. The session environment in src/lib/config.ts is
+ * a WHITELIST — PATH, HOME, LANG, ONESHOT_HOME and the identity variables — so
+ * `echo $GITLAB_TOKEN` prints an empty line; the app server the conductor
+ * starts gets the same whitelist, and scripts/app.cjs strips the token from
+ * the Django and webpack it spawns. The token reaches the GitLab MCP server's
+ * own subprocess. The skills' "never print GITLAB_TOKEN" rule is already true
+ * by construction for the environment.
  *
  * WHAT IT IS. The one path left is the file. `.env` is mode 600 and the session
  * runs as its owner, so `cat`, `grep`, a Read or Grep tool call or a
  * heredoc-free `sed -n` all reach it, and everything a phase prints goes into a
  * transcript that outlives the run. This closes that, and nothing else — a
  * guard that tried to catch every way a secret could be echoed would be a guard
- * nobody could reason about. It is best-effort against a phase reaching for the
- * file, not a sandbox: `sudo cat`, `python -c open(...)` and friends are not
- * parsed, which is why the skills still carry "never print GITLAB_TOKEN".
+ * nobody could reason about. It is best-effort against a session reaching for
+ * the file, not a sandbox: `sudo cat`, `python -c open(...)` and friends are
+ * not parsed, which is why the skills still carry "never print GITLAB_TOKEN".
  *
- * The token has a second home: src/lib/token.ts reads the desk's
- * ~/.config/oneshot/gitlab-token before .env, so that file is the same secret
- * by another path. ~/.claude.json carries the Claude account's OAuth state and
- * every MCP server's configured env; a session has no reason to read either.
+ * The token has other homes, every one of them src/lib/token.ts's sources:
+ * ~/.config/oneshot/gitlab-token, the `oneshot-gitlab` keychain item
+ * (`security find-generic-password`, denied as a command) and glab's
+ * config.yml. ~/.claude.json carries the Claude account's OAuth state and
+ * every MCP server's configured env; a session has no reason to read any.
  *
  * Writes are denied too, by redirect as much as by `sed -i`. A blind `>` over
  * one of these blanks the credential and every later session on the machine
  * starts without it; fixing a credential here is an operator's job.
  *
- * Scoped to these exact files. A work repo's .env belongs to the app the
- * session is there to run, and blocking it would break bringing that app up.
+ * Scoped to these files. Under ONESHOT_HOME every `.env.*` but `.env.example`
+ * (the tracked list of variable names) is a copy of the secrets; a work repo's
+ * .env and .env.* belong to the app the session is there to run, and blocking
+ * them would break bringing that app up.
  */
 const os = require('node:os');
 const path = require('node:path');
@@ -47,15 +54,31 @@ const HOME = os.homedir();
 const DENIED = [
   ENV_FILE,
   path.join(HOME, '.config', 'oneshot', 'gitlab-token'),
+  path.join(HOME, '.config', 'glab-cli', 'config.yml'),
   path.join(HOME, '.claude.json'),
 ];
 const DENIED_REAL = DENIED.map((f) => C.realish(f));
 
+/**
+ * A `.env` variant under ONESHOT_HOME: `.env.<anything>` but `.env.example`, or
+ * a glob starting `.env` (`cat .env*` reads the file itself).
+ */
+function envCopy(target) {
+  const base = path.basename(target);
+  if (base === '.env.example') return false;
+  if (!base.startsWith('.env.') && !(base.startsWith('.env') && /[*?[]/.test(base))) return false;
+  return C.isInside(target, C.ONESHOT);
+}
+
 /** The denied file `target` resolves to, or '' when it is none of them. */
 function deniedFile(target) {
   const i = DENIED_REAL.indexOf(C.realish(target));
-  return i === -1 ? '' : DENIED[i];
+  if (i !== -1) return DENIED[i];
+  return envCopy(target) ? target : '';
 }
+
+/** The keychain item src/lib/token.ts may read the token from: `security [opts] find-generic-password`. */
+const KEYCHAIN_READ = /(?:^|[\s;&|(`$/])security\s+(?:-\S+\s+)*find-generic-password\b/;
 
 const denial = (file) =>
   `Denied: ${file} holds this machine's credentials, and everything a session prints ` +
@@ -70,11 +93,12 @@ const denial = (file) =>
   'an operator resolves it, not you.';
 
 /**
- * A candidate path must END at one of the denied basenames, so `.env.example`
- * and `.env.local` are not it. Whether it is the denied file is decided after
- * expansion and resolution, by deniedFile().
+ * A candidate path is any word naming `.env` (with or without a suffix), a
+ * token file, ~/.claude.json or a config.yml. Whether it is a denied file is
+ * decided after expansion and resolution, by deniedFile() — so `.env.example`
+ * and a work repo's `.env.local` are candidates that come back clean.
  */
-const CANDIDATE = /(?:^|[\s'"<>|])([^\s'"<>|]*(?:\.env|gitlab-token|\.claude\.json))(?=$|[\s'"<>|])/g;
+const CANDIDATE = /(?:^|[\s'"<>|])([^\s'"<>|]*(?:\.env|gitlab-token|\.claude\.json|config\.yml)[^\s'"<>|]*)(?=$|[\s'"<>|])/g;
 const READER = /^\s*(cat|bat|less|more|head|tail|grep|egrep|rg|awk|sed|cut|sort|strings|xxd|od|open|cp|scp|rsync|source|\.)\b/;
 const WRITER = /^\s*(tee|dd|truncate|mv|ln|install)\b/;
 
@@ -107,6 +131,11 @@ try {
   }
 
   if (tool === 'Bash' && typeof input.command === 'string') {
+    if (KEYCHAIN_READ.test(input.command)) {
+      C.event('denied_secret_keychain', { command: input.command.slice(0, 120) });
+      C.deny(denial('the macOS keychain (`security find-generic-password`)'));
+    }
+
     // Resolve against the session's cwd rather than matching the string, so a
     // bare `cat .env` is judged by where it would actually land: this repo's
     // file is denied, the work repo's is the app's own business.
