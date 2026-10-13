@@ -16,6 +16,23 @@ import { parse } from 'dotenv';
 import { LEGACY_SELECTOR_KEYS, isPlaceholder, spellings } from './repourl.cjs';
 
 /**
+ * Settings Solo dropped: Slack, the board, Langfuse/OTel, token budgets, claims,
+ * phases, the automation mode, the read-only token, the MCP override and the
+ * port pool, plus ONESHOT_PHASE_IDLE_MIN (now ONESHOT_IDLE_MIN). Each one still
+ * in a .env reads as if it did something.
+ */
+const SOLO_DROPPED = [
+  'SLACK_BOT_TOKEN', 'ONESHOT_CHANNEL', 'ONESHOT_OWNER_SLACK_ID',
+  'BOARD_URL', 'BOARD_INGEST_TOKEN', 'BOARD_OPERATOR',
+  'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY', 'LANGFUSE_HOST', 'ONESHOT_OTEL',
+  'ONESHOT_WINDOW_TOKENS', 'ONESHOT_DAY_TOKENS', 'ONESHOT_RESERVE_PCT',
+  'ONESHOT_CLAIM_SETTLE_MS', 'ONESHOT_CLAIM_STALE_HOURS', 'ONESHOT_SKIP_PHASES',
+  'ONESHOT_AUTOMATION', 'ONESHOT_GOOGLE_SA_FILE', 'GITLAB_READ_TOKEN',
+  'GITLAB_MCP_CMD', 'GITLAB_MCP_ARGS', 'PORT_POOL', 'ONESHOT_APP_PORTS', 'ONESHOT_FE_PORT',
+  'ONESHOT_PHASE_IDLE_MIN',
+];
+
+/**
  * Keys the template has retired, in both spellings. The legacy selectors come
  * from repourl.cjs rather than from the template's prose, so a rewording of
  * .env.example cannot hide one — a disagreeing ONESHOT_PROJECT refuses boot.
@@ -23,6 +40,7 @@ import { LEGACY_SELECTOR_KEYS, isPlaceholder, spellings } from './repourl.cjs';
 export const RETIRED_KEYS: ReadonlySet<string> = new Set([
   ...LEGACY_SELECTOR_KEYS,
   ...spellings('ONESHOT_GITLAB_USERNAME'),
+  ...SOLO_DROPPED.flatMap(spellings),
 ]);
 
 /** The per-project path names, which are generated rather than listed in the template. */

@@ -32,8 +32,6 @@ export interface PhaseIdentity {
   ticket: number;
   phase: string;
   lap: number;
-  tier: string;
-  model: string;
 }
 
 /**
