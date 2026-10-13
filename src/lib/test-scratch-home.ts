@@ -1,25 +1,25 @@
 /**
- * A throwaway ONESHOT_HOME for tests that spawn hooks/automation-ready.cjs.
+ * A throwaway state/ for a test file: import it FIRST, before anything that
+ * imports config.ts.
  *
- * Its config/ is a symlink to this repo's, so the script reads the real labels
- * and branch policy; its state/ is its own, so the `automation_ready` verdict
- * the script appends to $ONESHOT_HOME/state/hook-events.jsonl lands in a temp
- * dir instead of this checkout's live state/, which the board collector reads.
- * Without it, every suite run left a dozen fake precheck verdicts for an
- * invented ticket in the live log.
+ * config.ts computes STATE — and RUNS, RUNS_ARCHIVE, the PAUSE files and the
+ * pid file from it — once, when it loads, from ONESHOT_STATE_DIR. Setting that
+ * variable here, to a fresh mkdtemp dir, therefore only works if this module
+ * runs before config.ts does; ES modules evaluate in import order, so it must
+ * be the first import that reaches config (after test-project-env.ts, which
+ * also imports nothing). Imported later, it changes nothing and the test writes
+ * into this checkout's live state/, which the dashboard and `npm run status`
+ * read.
  *
- * Imports nothing from config, so a test that must set its environment before
- * config loads can still import it first.
+ * Each test file runs in its own process under `node --test`, so each gets its
+ * own directory; it is removed when the process exits.
+ *
+ * Imports nothing from config, which is the point.
  */
-import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
-const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-
-export function scratchHome(): { home: string; cleanup: () => void } {
-  const home = mkdtempSync(join(tmpdir(), 'oneshot-ready-'));
-  symlinkSync(join(REPO, 'config'), join(home, 'config'));
-  return { home, cleanup: () => rmSync(home, { recursive: true, force: true }) };
-}
+const dir = mkdtempSync(join(tmpdir(), 'oneshot-state-'));
+process.env.ONESHOT_STATE_DIR = dir;
+process.on('exit', () => rmSync(dir, { recursive: true, force: true }));

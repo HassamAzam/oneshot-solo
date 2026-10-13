@@ -209,7 +209,16 @@ export const TICK_MS = 60_000;
  */
 export const ONESHOT_HOME: string = ROOT;
 
-export const STATE = join(ONESHOT_HOME, 'state');
+/**
+ * Where runs, pause files and the pid file live: ONESHOT_STATE_DIR, else
+ * ONESHOT_HOME/state. Everything below derives from it, once, at load.
+ *
+ * The override exists so a test can point every derived path at a temp dir
+ * (src/lib/test-scratch-home.ts) instead of this checkout's live state/. The
+ * guard hooks do not read it — hooks/_common.cjs derives state/ from
+ * ONESHOT_HOME — so it is not an operator setting for a live conductor.
+ */
+export const STATE = expandPath(envOr('ONESHOT_STATE_DIR', '')) || join(ONESHOT_HOME, 'state');
 export const RUNS = join(STATE, 'runs');
 /** Where a finished run's whole directory goes when its ticket is run again. */
 export const RUNS_ARCHIVE = join(STATE, 'runs-archive');

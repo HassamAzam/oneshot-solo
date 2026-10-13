@@ -1,40 +1,44 @@
 /**
- * One ticket, one page: `state/runs/<iid>/report.html`.
+ * One run, one page: what the dashboard serves at `/run/<iid>`, and what
+ * `npm run report` writes to `<run dir>/report.html`.
  *
- * The question this answers is the operator's, asked in their words — what was
- * the transcript, and which agents ran. Everything on the page serves one of
- * those two, and the deliberate omissions are as load-bearing as the content:
- * there is no token column, no cost column and no live view. `weighted` is
- * never even read off the journal. Spend is a quota concern and quota.ts owns
- * it; putting it here would turn the one page an operator opens after a run
- * into a billing report they have to look past.
+ * The questions this answers are the operator's, asked in their words — what
+ * is the ticket's status, how long did it take, and what did the session
+ * actually do. The header carries the first two (status, wall clock, attempts,
+ * turns, tokens and cost — both labelled est., since a subscription bills
+ * nothing per call — the MR and whether it merged, and the design and plan the
+ * session wrote); one row per attempt and its readable transcript carry the
+ * third. Checkpoint rows mark where the session reached a superpowers skill or
+ * opened the MR, and compaction rows mark where its context was summarised —
+ * the two things worth finding in a transcript several thousand entries long.
  *
- * Everything is read from `state/runs/<iid>/` and nothing from SQLite. The
- * journal and the transcripts ARE the record of a run — the database holds the
- * conductor's scheduling state, which is a different question and, for a run
- * that finished hours ago, an emptier one.
+ * Everything is read from one run directory — live (`state/runs/<iid>/`) or
+ * archived (`state/runs-archive/<iid>-<runId>/`) — through the journal and the
+ * transcript tee. They ARE the record of a run; there is no database.
  *
  * Two facts about the source data shape the reader.
  *
- * A transcript FILE is not a session. A lap that fails and is re-entered reuses
- * its lap number, and phase.ts appends to the same tee, so `verify-lap0.jsonl`
- * legitimately holds six session starts and eight result frames. So the file is
- * counted rather than assumed: 'init' frames are attempts, 'result' frames are
- * results, and both are shown BESIDE the turn count the journal declared. When
- * those three numbers disagree they are the most useful thing on the page —
- * that is how a phase recorded 'ok' with zero turns becomes legible as a
- * session that worked for ninety minutes and never got to say so.
+ * A transcript FILE is not a session. An attempt that resumes appends to its
+ * own tee, and a run lifted from oneshot holds phase-named tees that re-entered
+ * one lap number many times. So the file is counted rather than assumed: 'init'
+ * frames are sessions and 'result' frames are results, kept beside the turn
+ * count the journal declared. When those numbers disagree, that is how an
+ * attempt recorded 'ok' with zero turns becomes legible as a session that
+ * worked for ninety minutes and never got to say so.
  *
  * Subagent traffic is INLINE. A frame dispatched by a Task carries the Task's
  * tool_use id in `parent_tool_use_id`, so the agent that produced a turn is
  * recoverable and every turn is attributed rather than dropped into one flat
- * stream that reads as if the phase did all of it itself.
+ * stream that reads as if the session did all of it itself.
  */
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { envOr, runDir } from './config.js';
-import { readJournal, type PhaseRecord, type RunJournal } from './artifacts.js';
+import { basename, dirname, join, resolve } from 'node:path';
+import { RUNS_ARCHIVE, envOr, runDir } from './config.js';
+import { readJournalFrom, type PhaseRecord, type RunJournal } from './journal.js';
 import { log } from './log.js';
+import {
+  checkpointOf, fmtDuration, fmtTokens, modelUsageTokens, runSummary, type RunSummary,
+} from './telemetry.js';
 
 /**
  * Per-string caps, applied while parsing rather than while rendering.
@@ -52,20 +56,18 @@ const ARG_LIMIT = 400;
 const STDERR_LIMIT = 400;
 
 /**
- * Agents this project dispatches on purpose, listed so they can be shown first.
+ * Agents this project dispatches on purpose, listed so they can be shown first:
+ * ONESHOT_PROJECT_AGENTS, comma-separated, else the ERP context's agents.
  *
  * Explore and general-purpose still appear — they ran, and a page that hides
  * what ran is a page that has to be verified against the raw JSONL anyway — but
  * they sort below these, because "how many reviewer agents ran" should be
  * answerable without reading past the built-ins.
  */
-const PROJECT_AGENTS = new Set([
-  'backend-agent', 'frontend-agent', 'qa-agent', 'util-reuse-agent',
-  'planner-agent', 'researcher-agent',
-]);
-
-function isProjectAgent(name: string): boolean {
-  return PROJECT_AGENTS.has(name) || name.endsWith('-reviewer-agent');
+function projectAgents(): Set<string> {
+  return new Set(envOr('ONESHOT_PROJECT_AGENTS',
+    'backend-agent,frontend-agent,backend-reviewer-agent,frontend-reviewer-agent,util-reuse-agent')
+    .split(',').map((s) => s.trim()).filter(Boolean));
 }
 
 // ------------------------------------------------------------------ redaction
@@ -190,16 +192,30 @@ export interface AgentDispatch {
 }
 
 export interface TranscriptEntry {
-  kind: 'session' | 'text' | 'tool' | 'result' | 'outcome' | 'stderr';
-  /** Tool name, result subtype, or the model of a session start. */
+  /**
+   * `checkpoint` marks a superpowers skill launched or the MR opened, and comes
+   * just before the tool entry it was read from; `compaction` marks the
+   * session's context being summarised.
+   */
+  kind: 'session' | 'text' | 'tool' | 'result' | 'outcome' | 'stderr' | 'checkpoint' | 'compaction';
+  /** Tool name, result subtype, checkpoint name, or the model of a session start. */
   label: string;
   text: string;
-  /** The agent that produced this turn, absent for the phase's own session. */
+  /** The agent that produced this turn, absent for the session's own turns. */
   agent?: string;
+  /** The frame's tee timestamp (epoch ms), when the tee recorded one. */
+  ts?: number;
+  /**
+   * Time since the previous timestamped frame — how long the model thought, or
+   * the tool ran, before this. On the first non-checkpoint entry of a frame only.
+   */
+  elapsedMs?: number;
 }
 
 export interface PhaseReport {
+  /** 'ticket' for a Solo attempt; a phase name in a run lifted from oneshot. */
   phase: string;
+  /** The attempt number. */
   lap: number;
   status: string;
   startedAt: number;
@@ -208,6 +224,13 @@ export interface PhaseReport {
   model: string;
   /** What the journal declared. */
   turns: number;
+  /** Input + output tokens from the record's `modelUsage`, subagents included (est.). */
+  tokens: number;
+  costUsd: number;
+  /** The attempt resumed the previous attempt's session. */
+  resumed: boolean;
+  /** Checkpoint names in the order the transcript reached them. */
+  checkpoints: string[];
   /** 'init' frames actually in the transcript. */
   attempts: number;
   /** 'result' frames actually in the transcript. */
@@ -227,9 +250,12 @@ export interface ReportModel {
   createdAt: number;
   mrIid: number | null;
   mrUrl: string;
-  mergedSha: string;
+  merged: boolean;
   blockedWhy: string;
-  remediations: Array<{ phase: string; reason: string; fixed: boolean; changes: string[] }>;
+  /** Null for a directory holding transcripts but no journal. */
+  summary: RunSummary | null;
+  /** The design and plan the session wrote, as dashboard links; only files that exist. */
+  artifacts: Array<{ name: string; href: string }>;
   phases: PhaseReport[];
   agentCount: number;
   generatedAt: number;
@@ -281,12 +307,18 @@ function resultText(content: unknown): string {
  * Walk one JSONL file.
  *
  * Every line is parsed defensively. A transcript is a tee of a live stream, so
- * the last line of a phase killed mid-write is routinely half a JSON object,
+ * the last line of a session killed mid-write is routinely half a JSON object,
  * and one truncated line must never cost the other nine thousand.
+ *
+ * Each frame's tee timestamp is stamped on the entries it produced, and the gap
+ * since the previous timestamped frame goes on the first of them that is not a
+ * checkpoint bar. Frames written before the tee carried `ts` simply have none.
  */
 function parseTranscript(path: string): ParsedTranscript {
   const out: ParsedTranscript = { attempts: 0, results: 0, agents: [], entries: [] };
   const dispatchOf = new Map<string, AgentDispatch>();
+  const ours = projectAgents();
+  let prevTs: number | null = null;
 
   for (const line of readFileSync(path, 'utf8').split('\n')) {
     if (!line) continue;
@@ -297,90 +329,116 @@ function parseTranscript(path: string): ParsedTranscript {
       continue;
     }
 
-    const parent = typeof frame.parent_tool_use_id === 'string' ? frame.parent_tool_use_id : '';
-    const via = dispatchOf.get(parent)?.agent;
-    const tag = via ? { agent: via } : {};
+    const from = out.entries.length;
+    readFrame(frame, out, dispatchOf, ours);
 
-    if (frame.type === 'cli-stderr') {
-      const text = clean(frame.text, STDERR_LIMIT).trim();
-      if (text) out.entries.push({ kind: 'stderr', label: 'stderr', text });
-      continue;
+    const ts = typeof frame.ts === 'number' ? frame.ts : null;
+    if (ts === null) continue;
+    let timed = false;
+    for (const e of out.entries.slice(from)) {
+      e.ts = ts;
+      if (!timed && e.kind !== 'checkpoint' && prevTs !== null) e.elapsedMs = Math.max(0, ts - prevTs);
+      if (e.kind !== 'checkpoint') timed = true;
     }
-
-    if (frame.type === 'system' && frame.subtype === 'init') {
-      out.attempts += 1;
-      out.entries.push({
-        kind: 'session',
-        label: String(frame.model ?? ''),
-        text: `session start — ${String(frame.session_id ?? 'no id')}`,
-      });
-      continue;
-    }
-
-    if (frame.type === 'result') {
-      out.results += 1;
-      out.entries.push({
-        kind: 'outcome',
-        label: String(frame.subtype ?? 'result'),
-        text: clean(frame.result ?? frame.errors ?? '', RESULT_LIMIT),
-      });
-      continue;
-    }
-
-    const message = frame.message as Record<string, unknown> | undefined;
-    const content = message?.content;
-    if (!Array.isArray(content)) continue;
-
-    for (const raw of content) {
-      const block = raw as Record<string, unknown>;
-
-      if (block.type === 'text' && frame.type === 'assistant') {
-        const text = clean(block.text, TEXT_LIMIT).trim();
-        if (text) out.entries.push({ kind: 'text', label: 'assistant', text, ...tag });
-        continue;
-      }
-
-      if (block.type === 'tool_use') {
-        const name = String(block.name ?? 'tool');
-        out.entries.push({ kind: 'tool', label: name, text: argSummary(block.input), ...tag });
-        if (name !== 'Task') continue;
-        const input = (block.input ?? {}) as Record<string, unknown>;
-        const dispatch: AgentDispatch = {
-          agent: clean(input.subagent_type ?? 'unknown', 80) || 'unknown',
-          description: clean(input.description ?? '', ARG_LIMIT),
-          status: 'unknown',
-          durationMs: null,
-          toolUses: null,
-          project: isProjectAgent(String(input.subagent_type ?? '')),
-        };
-        out.agents.push(dispatch);
-        if (typeof block.id === 'string') dispatchOf.set(block.id, dispatch);
-        continue;
-      }
-
-      if (block.type === 'tool_result') {
-        const id = String(block.tool_use_id ?? '');
-        const dispatch = dispatchOf.get(id);
-        if (dispatch) {
-          const meta = (frame.tool_use_result ?? {}) as Record<string, unknown>;
-          dispatch.status = clean(meta.status ?? (block.is_error ? 'error' : 'completed'), 40);
-          const ms = meta.totalDurationMs;
-          dispatch.durationMs = typeof ms === 'number' ? ms : null;
-          const uses = meta.totalToolUseCount;
-          dispatch.toolUses = typeof uses === 'number' ? uses : null;
-        }
-        out.entries.push({
-          kind: 'result',
-          label: dispatch ? `${dispatch.agent} returned` : (block.is_error ? 'error' : 'result'),
-          text: clean(resultText(block.content), RESULT_LIMIT),
-          ...tag,
-        });
-      }
-    }
+    prevTs = ts;
   }
 
   out.agents.sort((a, b) => Number(b.project) - Number(a.project));
   return out;
+}
+
+/** The entries one frame contributes, appended to `out`. */
+function readFrame(
+  frame: Record<string, unknown>, out: ParsedTranscript, dispatchOf: Map<string, AgentDispatch>, ours: Set<string>,
+): void {
+  const parent = typeof frame.parent_tool_use_id === 'string' ? frame.parent_tool_use_id : '';
+  const via = dispatchOf.get(parent)?.agent;
+  const tag = via ? { agent: via } : {};
+
+  if (frame.type === 'cli-stderr') {
+    const text = clean(frame.text, STDERR_LIMIT).trim();
+    if (text) out.entries.push({ kind: 'stderr', label: 'stderr', text });
+    return;
+  }
+
+  if (frame.type === 'system' && frame.subtype === 'init') {
+    out.attempts += 1;
+    out.entries.push({
+      kind: 'session',
+      label: String(frame.model ?? ''),
+      text: `session start — ${String(frame.session_id ?? 'no id')}`,
+    });
+    return;
+  }
+
+  if (frame.type === 'system' && frame.subtype === 'compact_boundary') {
+    const meta = (frame.compact_metadata ?? {}) as Record<string, unknown>;
+    out.entries.push({ kind: 'compaction', label: 'context compacted', text: `${String(meta.pre_tokens ?? '?')} tokens` });
+    return;
+  }
+
+  if (frame.type === 'result') {
+    out.results += 1;
+    out.entries.push({
+      kind: 'outcome',
+      label: String(frame.subtype ?? 'result'),
+      text: clean(frame.result ?? frame.errors ?? '', RESULT_LIMIT),
+    });
+    return;
+  }
+
+  const message = frame.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+  if (!Array.isArray(content)) return;
+
+  for (const raw of content) {
+    const block = raw as Record<string, unknown>;
+
+    if (block.type === 'text' && frame.type === 'assistant') {
+      const text = clean(block.text, TEXT_LIMIT).trim();
+      if (text) out.entries.push({ kind: 'text', label: 'assistant', text, ...tag });
+      continue;
+    }
+
+    if (block.type === 'tool_use') {
+      const name = String(block.name ?? 'tool');
+      const checkpoint = checkpointOf(name, block.input);
+      if (checkpoint) out.entries.push({ kind: 'checkpoint', label: clean(checkpoint, 80), text: '', ...tag });
+      out.entries.push({ kind: 'tool', label: name, text: argSummary(block.input), ...tag });
+      if (name !== 'Task') continue;
+      const input = (block.input ?? {}) as Record<string, unknown>;
+      const dispatch: AgentDispatch = {
+        agent: clean(input.subagent_type ?? 'unknown', 80) || 'unknown',
+        description: clean(input.description ?? '', ARG_LIMIT),
+        status: 'unknown',
+        durationMs: null,
+        toolUses: null,
+        project: ours.has(String(input.subagent_type ?? '')),
+      };
+      out.agents.push(dispatch);
+      if (typeof block.id === 'string') dispatchOf.set(block.id, dispatch);
+      continue;
+    }
+
+    if (block.type === 'tool_result') {
+      const id = String(block.tool_use_id ?? '');
+      const dispatch = dispatchOf.get(id);
+      if (dispatch) {
+        const meta = (frame.tool_use_result ?? {}) as Record<string, unknown>;
+        dispatch.status = clean(meta.status ?? (block.is_error ? 'error' : 'completed'), 40);
+        const ms = meta.totalDurationMs;
+        dispatch.durationMs = typeof ms === 'number' ? ms : null;
+        const uses = meta.totalToolUseCount;
+        dispatch.toolUses = typeof uses === 'number' ? uses : null;
+      }
+      out.entries.push({
+        kind: 'result',
+        label: dispatch ? `${dispatch.agent} returned` : (block.is_error ? 'error' : 'result'),
+        text: clean(resultText(block.content), RESULT_LIMIT),
+        ...tag,
+      });
+    }
+  }
 }
 
 function readTranscript(path: string): ParsedTranscript {
@@ -401,17 +459,31 @@ function transcriptFiles(dir: string): string[] {
   }
 }
 
-function phaseFrom(rec: PhaseRecord, dir: string, file: string): PhaseReport {
+function checkpointsIn(parsed: ParsedTranscript): string[] {
+  return parsed.entries.filter((e) => e.kind === 'checkpoint').map((e) => e.label);
+}
+
+/**
+ * One journal record and its transcript. An attempt still 'running' has no end
+ * yet; its clock runs only while the conductor holding the run is alive, so a
+ * dead conductor's last attempt does not read as hours long.
+ */
+function phaseFrom(rec: PhaseRecord, dir: string, file: string, live: boolean): PhaseReport {
   const parsed = file ? readTranscript(join(dir, file)) : EMPTY;
+  const end = rec.endedAt ?? (live && rec.status === 'running' ? Date.now() : rec.startedAt);
   return {
     phase: rec.phase,
     lap: rec.lap,
     status: rec.status,
     startedAt: rec.startedAt,
-    endedAt: rec.endedAt,
-    durationMs: Math.max(0, rec.endedAt - rec.startedAt),
+    endedAt: rec.endedAt ?? 0,
+    durationMs: Math.max(0, end - rec.startedAt),
     model: rec.model ?? '',
     turns: rec.turns ?? 0,
+    tokens: modelUsageTokens(rec.modelUsage),
+    costUsd: rec.costUsd ?? 0,
+    resumed: rec.resumed === true,
+    checkpoints: checkpointsIn(parsed),
     attempts: parsed.attempts,
     results: parsed.results,
     error: clean(rec.error ?? '', RESULT_LIMIT),
@@ -426,7 +498,8 @@ function phaseFrom(rec: PhaseRecord, dir: string, file: string): PhaseReport {
  *
  * Not a curiosity — it is what a run that died between the session ending and
  * recordPhase() looks like on disk, and it is the one case where the file is
- * the ONLY evidence the phase ever happened.
+ * the ONLY evidence the attempt ever happened. A run lifted from oneshot shows
+ * its phase-named tees the same way whenever its journal lacks the record.
  */
 function orphanPhase(dir: string, file: string): PhaseReport {
   const parsed = readTranscript(join(dir, file));
@@ -440,72 +513,88 @@ function orphanPhase(dir: string, file: string): PhaseReport {
     durationMs: 0,
     model: '',
     turns: 0,
+    tokens: 0,
+    costUsd: 0,
+    resumed: false,
+    checkpoints: checkpointsIn(parsed),
     attempts: parsed.attempts,
     results: parsed.results,
-    error: 'no journal record — the phase never reported back',
+    error: 'no journal record — the attempt never reported back',
     transcript: file,
     agents: parsed.agents,
     entries: parsed.entries,
   };
 }
 
-function header(iid: number, j: RunJournal | null): Omit<ReportModel, 'phases' | 'agentCount'> {
+/** The design and plan the session wrote to the run's artifacts, linked through the dashboard. */
+function artifactLinks(dir: string, iid: number, archived: string | null): ReportModel['artifacts'] {
+  const query = archived ? `?archived=${encodeURIComponent(archived)}` : '';
+  return [`${iid}-design.md`, `${iid}-plan.md`]
+    .filter((name) => existsSync(join(dir, 'artifacts', name)))
+    .map((name) => ({ name, href: `/artifacts/${iid}/${encodeURIComponent(name)}${query}` }));
+}
+
+function header(iid: number, j: RunJournal | null, summary: RunSummary | null): Omit<ReportModel, 'phases' | 'agentCount' | 'artifacts'> {
+  const title = clean(j?.title ?? '', 300);
+  const mrUrl = clean(j?.mrUrl ?? '', 300);
   return {
     iid,
-    title: clean(j?.title ?? '', 300),
+    title,
     url: clean(j?.url ?? '', 300),
     runId: clean(j?.runId ?? '', 80),
     status: j?.status ?? 'unknown',
     createdAt: j?.createdAt ?? 0,
     mrIid: j?.mrIid ?? null,
-    mrUrl: clean(j?.mrUrl ?? '', 300),
-    mergedSha: clean(j?.mergedSha ?? '', 60),
+    mrUrl,
+    merged: j?.merged === true,
     blockedWhy: clean(j?.blockedWhy ?? '', RESULT_LIMIT),
-    remediations: (j?.remediations ?? []).map((r) => ({
-      phase: r.phase,
-      reason: clean(r.reason, ARG_LIMIT),
-      fixed: r.fixed,
-      changes: r.changes.map((c) => clean(c, ARG_LIMIT)),
-    })),
+    // Every string that reaches the payload goes through clean(), these two included.
+    summary: summary && { ...summary, title, mrUrl: mrUrl || null },
     generatedAt: Date.now(),
   };
 }
 
 /**
- * Build the page's data, or null when there is no run to describe.
+ * Build the page's data from one run directory — `runDir(iid)` or an archived
+ * `RUNS_ARCHIVE/<iid>-<runId>` — or null when there is no run to describe.
  *
- * The journal supplies the phase rows because it is the only thing that knows
- * ORDER, status and wall clock; the transcripts supply everything else. Neither
- * is required: a run directory holding only transcripts still reports, and a
- * journal whose phases never wrote a tee (merge) still lists them.
+ * The journal supplies the attempt rows because it is the only thing that
+ * knows ORDER, status and wall clock; the transcripts supply everything else.
+ * Neither is required: a directory holding only transcripts still reports (its
+ * iid read off the directory name), and a journal record whose attempt never
+ * wrote a tee still lists it.
  */
-export function buildReportModel(iid: number): ReportModel | null {
+export function buildReportModel(dir: string): ReportModel | null {
   try {
-    const dir = runDir(iid);
     if (!existsSync(dir)) return null;
 
-    const journal = readJournal(iid);
+    const journal = readJournalFrom(dir);
     const transcripts = join(dir, 'transcripts');
     const files = transcriptFiles(transcripts);
     if (!journal && files.length === 0) return null;
+
+    const archived = resolve(dirname(dir)) === resolve(RUNS_ARCHIVE) ? basename(dir) : null;
+    const iid = journal?.iid ?? Number(/^\d+/.exec(basename(dir))?.[0] ?? 0);
+    const summary = journal ? runSummary(journal, dir, archived) : null;
 
     const unused = new Set(files);
     const phases: PhaseReport[] = (journal?.phases ?? []).map((rec) => {
       const file = `${rec.phase}-lap${rec.lap}.jsonl`;
       const found = unused.delete(file) ? file : '';
-      return phaseFrom(rec, transcripts, found);
+      return phaseFrom(rec, transcripts, found, summary?.live ?? false);
     });
     for (const file of files) {
       if (unused.has(file)) phases.push(orphanPhase(transcripts, file));
     }
 
     return {
-      ...header(iid, journal),
+      ...header(iid, journal, summary),
+      artifacts: artifactLinks(dir, iid, archived),
       phases,
       agentCount: phases.reduce((n, p) => n + p.agents.length, 0),
     };
   } catch (err) {
-    log.warn(`report: could not build the model for #${iid}`, { error: (err as Error).message });
+    log.warn(`report: could not build the model for ${dir}`, { error: (err as Error).message });
     return null;
   }
 }
@@ -553,16 +642,19 @@ tr.row{cursor:pointer}
 tr.row:hover td{background:#f2f6fb}
 tr.row.open td{background:#eef4fc}
 td.num{text-align:right;font-variant-numeric:tabular-nums}
-td.phase{font-weight:600}
+td.phase{font-weight:600;white-space:nowrap}
 td.err{color:#a3341f;max-width:340px;overflow-wrap:anywhere}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 .warnnum{background:#fdf1cf;border-radius:3px;padding:0 5px;font-weight:600}
 .pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600;
  background:#e6e9ed;color:#3c444d}
-.pill.ok{background:#dff3e2;color:#20603a}
+.pill.ok,.pill.done{background:#dff3e2;color:#20603a}
+.pill.running,.pill.claimed{background:#dde9f9;color:#1d4f8a}
 .pill.failed,.pill.refused,.pill.blocked,.pill.aborted{background:#fadfd9;color:#8f2c17}
-.pill.warned,.pill.unrecorded{background:#fdf1cf;color:#7a5606}
+.pill.warned,.pill.unrecorded,.pill.infra{background:#fdf1cf;color:#7a5606}
 .pill.skipped,.pill.parked{background:#e6e9ed;color:#5b636d}
+.est{color:#8a929c;font-size:11px}
+td.cps{color:#4a6f9e;font-size:12px}
 .hidden{display:none}
 .detail td{background:#fbfcfd;padding:0}
 .pad{padding:14px 16px}
@@ -586,6 +678,13 @@ pre{margin:2px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;
 .e.tool .tn{font-weight:600}
 .e.stderr pre{color:#8a6d3b}
 .e.outcome{background:#f4f6f8}
+.el{display:inline-block;min-width:58px;color:#9aa3ad;font-size:11px;font-variant-numeric:tabular-nums;
+ vertical-align:top}
+.bar{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;margin:6px -16px;padding:6px 16px;font-size:12.5px}
+.bar.checkpoint{background:#e8f1fb;border-top:1px solid #b9d0ec;border-bottom:1px solid #b9d0ec;color:#1d4f8a}
+.bar.compaction{background:#fbf3e2;border-top:1px dashed #e2c58a;border-bottom:1px dashed #e2c58a;color:#7a5606}
+.bar .k{color:inherit;opacity:.75}
+.bar .at{margin-left:auto;color:#6b7480;font-variant-numeric:tabular-nums}
 button.more{margin-top:4px;border:1px solid #cfd6de;background:#fff;border-radius:4px;
  padding:1px 8px;font-size:11px;cursor:pointer;color:#3c444d}
 `;
@@ -611,8 +710,12 @@ function dur(ms){
   if(ms<1000)return ms+'ms';
   var s=Math.round(ms/1000);
   if(s<60)return (ms/1000).toFixed(1)+'s';
-  return Math.floor(s/60)+'m '+(s%60)+'s';
+  if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';
+  return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
 }
+function since(ms){return '+'+(ms<1000?(ms/1000).toFixed(1)+'s':dur(ms));}
+function k(n){return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1000?Math.round(n/1000)+'k':String(n);}
+function clock(ts){return new Date(ts).toTimeString().slice(0,8);}
 function cell(row,cls,txt){var td=el('td',cls,txt);row.appendChild(td);return td;}
 function num(row,value,warn){
   var td=cell(row,'num','');
@@ -652,10 +755,21 @@ function body(e){
   box.appendChild(b);
   return box;
 }
+function bar(e){
+  var d=el('div','bar '+e.kind);
+  if(e.elapsedMs!=null)d.appendChild(el('span','el',since(e.elapsedMs)));
+  d.appendChild(el('span','k',e.kind==='checkpoint'?'checkpoint':'compaction'));
+  d.appendChild(el('b',null,e.kind==='checkpoint'?e.label:e.label+' at '+e.text));
+  if(e.agent)d.appendChild(el('span','who',e.agent));
+  if(e.ts)d.appendChild(el('span','at',clock(e.ts)));
+  return d;
+}
 function turns(box,p){
-  if(!p.entries.length){box.appendChild(el('div','none','No transcript for this phase.'));return;}
+  if(!p.entries.length){box.appendChild(el('div','none','No transcript for this attempt.'));return;}
   p.entries.forEach(function(e){
+    if(e.kind==='checkpoint'||e.kind==='compaction'){box.appendChild(bar(e));return;}
     var d=el('div','e '+e.kind+(e.agent?' sub':''));
+    if(e.elapsedMs!=null)d.appendChild(el('span','el',since(e.elapsedMs)));
     d.appendChild(el('span','k',e.kind==='tool'?'tool':e.label||e.kind));
     if(e.agent)d.appendChild(el('span','who',e.agent));
     d.appendChild(body(e));
@@ -665,15 +779,16 @@ function turns(box,p){
 var tbody=document.getElementById('rows');
 D.phases.forEach(function(p){
   var row=el('tr','row');
-  cell(row,'phase',p.phase);
-  cell(row,'num',String(p.lap));
+  cell(row,'phase',p.phase==='ticket'?String(p.lap):p.phase+' / '+p.lap);
   var st=cell(row,null,'');
   st.appendChild(el('span','pill '+p.status,p.status));
   cell(row,null,dur(p.durationMs));
   cell(row,'mono',p.model);
   num(row,p.turns,p.turns===0&&p.attempts>0);
-  num(row,p.attempts,p.attempts>1);
-  num(row,p.results,p.attempts!==p.results);
+  cell(row,'num',p.tokens?k(p.tokens):'');
+  cell(row,null,p.resumed?'yes':'');
+  var cps=cell(row,'cps',p.checkpoints.map(function(c){return c.replace(/^superpowers:/,'');}).join(', '));
+  cps.title=p.checkpoints.join(', ');
   cell(row,'err',p.error);
   var detail=el('tr','detail hidden');
   var host=cell(detail,null,'');
@@ -696,12 +811,25 @@ D.phases.forEach(function(p){
 })();
 `;
 
+/**
+ * Status, how long it took, what it cost, where it landed. Tokens and cost are
+ * the SDK's figures for a subscription that bills nothing per call, hence est.
+ */
 function headerHtml(m: ReportModel): string {
   const bits: string[] = [];
-  bits.push(`<span><b class="pill ${escapeHtml(m.status)}">${escapeHtml(m.status)}</b></span>`);
-  if (m.url) bits.push(`<span><a href="${escapeHtml(m.url)}">ticket #${m.iid}</a></span>`);
+  const s = m.summary;
+  bits.push(`<span><b class="pill ${escapeHtml(m.status)}">${escapeHtml(m.status)}</b>${s?.live ? ' live' : ''}</span>`);
+  if (s) {
+    bits.push(`<span><b>${fmtDuration(s.durationMs)}</b> wall clock</span>`);
+    bits.push(`<span><b>${s.attempts}</b> attempt${s.attempts === 1 ? '' : 's'}</span>`);
+    bits.push(`<span><b>${s.turns}</b> turns</span>`);
+    bits.push(`<span><b>${fmtTokens(s.tokens)}</b> tokens <span class="est">est.</span></span>`);
+    bits.push(`<span><b>$${s.costUsd.toFixed(2)}</b> <span class="est">est.</span></span>`);
+  }
   if (m.mrUrl) bits.push(`<span><a href="${escapeHtml(m.mrUrl)}">MR !${m.mrIid ?? ''}</a></span>`);
-  bits.push(`<span><b>${m.phases.length}</b> phases</span>`);
+  bits.push(`<span>merged <b>${m.merged ? 'yes' : 'no'}</b></span>`);
+  for (const a of m.artifacts) bits.push(`<span><a href="${escapeHtml(a.href)}">${escapeHtml(a.name)}</a></span>`);
+  if (m.url) bits.push(`<span><a href="${escapeHtml(m.url)}">ticket #${m.iid}</a></span>`);
   bits.push(`<span><b>${m.agentCount}</b> agents</span>`);
   if (m.runId) bits.push(`<span>${escapeHtml(m.runId)}</span>`);
   if (m.blockedWhy) bits.push(`<span>blocked: ${escapeHtml(m.blockedWhy.slice(0, 200))}</span>`);
@@ -712,7 +840,7 @@ function headerHtml(m: ReportModel): string {
 }
 
 export function renderHtml(m: ReportModel): string {
-  const cols = ['phase', 'lap', 'status', 'duration', 'model', 'turns', 'attempts', 'results', 'error'];
+  const cols = ['attempt', 'status', 'duration', 'model', 'turns', 'tokens', 'resumed', 'checkpoints', 'error'];
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -731,17 +859,17 @@ ${headerHtml(m)}
 }
 
 /**
- * Write `state/runs/<iid>/report.html`, returning its path or null.
+ * Write `state/runs/<iid>/report.html` — the single-file export behind
+ * `npm run report` — returning its path or null.
  *
- * Called from a run's finish path, and therefore built so it CANNOT fail one. A
- * malformed transcript, a directory that was archived out from under it, a file
- * too large to read — every one of those is a warning and a null, exactly as
- * the transcript tee in phase.ts treats its own write. Nothing here is worth a
- * completed ticket.
+ * The conductor does not call this at finish; the dashboard renders the same
+ * page in memory. It is still built so it CANNOT fail a caller: a malformed
+ * transcript, a directory archived out from under it, a file too large to read
+ * — every one of those is a warning and a null.
  */
 export function writeRunReport(iid: number): string | null {
   try {
-    const model = buildReportModel(iid);
+    const model = buildReportModel(runDir(iid));
     if (!model) return null;
     const path = join(runDir(iid), 'report.html');
     writeFileSync(path, renderHtml(model));
