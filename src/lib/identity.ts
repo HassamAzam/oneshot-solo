@@ -197,6 +197,22 @@ export async function checkIdentity(): Promise<IdentityCheck> {
   return { username: token?.username ?? '', token, claudeUsername, warning };
 }
 
+/**
+ * Ask GitLab again who this desk is — only while nobody has answered yet and
+ * GitLab is reachable. Boot asks once and does not require GitLab, so a
+ * conductor started before the VPN was up would otherwise skip every assigned
+ * ticket for its whole life. The tick calls this; it is one cheap /user call
+ * per tick until it resolves, and nothing once it has. Returns the check when
+ * one was made, else null.
+ */
+export async function recheckIdentity(
+  reachable: boolean,
+  deps: { username: () => string; check: () => Promise<IdentityCheck> } = { username: deskUsername, check: checkIdentity },
+): Promise<IdentityCheck | null> {
+  if (deps.username() || !reachable) return null;
+  return deps.check();
+}
+
 /** One line for the boot banner. Never prints an email or a token. */
 export function describeIdentity(c: IdentityCheck): string {
   if (!c.token) return 'identity   unresolved — no usable GitLab token, assigned tickets skipped';

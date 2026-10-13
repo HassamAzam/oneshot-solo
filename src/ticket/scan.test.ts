@@ -31,6 +31,9 @@ test('triage: assigned to this desk is claimable, to a teammate is dropped silen
   const nobody = triage(tickets, '');
   assert.deepEqual(nobody.candidates.map((c) => c.iid), [13]);
   assert.deepEqual(nobody.skipped.map((s) => s.iid), [11, 12]);
+  // The token is fine; GitLab has not answered yet — the hint must not send the operator to token:set.
+  assert.match(nobody.skipped[0]!.why, /GitLab has not yet answered who this desk is \(will retry each tick\)/);
+  assert.doesNotMatch(nobody.skipped[0]!.why, /token:set/);
 });
 
 test('orderCandidates puts a ticket whose last run blocked behind ready work, keeping order within each half', () => {

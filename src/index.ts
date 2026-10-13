@@ -22,7 +22,7 @@ import {
   appPort, auditAuth, mergeMode, pathSources, projectConfig, repoIdentity, seedFrom, sessionModel, superpowersPath,
 } from './lib/config.js';
 import { resolveToken, setupHint } from './lib/token.js';
-import { checkIdentity, describeIdentity } from './lib/identity.js';
+import { checkIdentity, describeIdentity, recheckIdentity } from './lib/identity.js';
 import { checkoutFindings, identityFindings, relaxRepoChecks, repoCheckOverrideNotice } from './lib/repocheck.js';
 import { ensureClaudeDir } from './lib/claudedir.js';
 import { pidAlive } from './lib/journal.js';
@@ -140,7 +140,8 @@ async function banner(): Promise<void> {
   log.info(`base       ${cfg.branches.base}   merge ${mergeMode()}   model ${sessionModel()}   port ${appPort()}`);
   log.info(`superpowers ${superpowersPath()}`);
   // The assignee rule reads this desk's username from the same token every
-  // GitLab write is made with; resolved once, here.
+  // GitLab write is made with; resolved here, and by the tick while GitLab
+  // has not answered (recheckIdentity).
   const idc = await checkIdentity();
   log.info(describeIdentity(idc));
   if (idc.warning) log.warn(idc.warning);
@@ -148,7 +149,9 @@ async function banner(): Promise<void> {
 }
 
 async function tick(): Promise<void> {
-  await probe();
+  const net = await probe();
+  const idc = await recheckIdentity(net.state === 'ok');
+  if (idc?.username) log.info(describeIdentity(idc));
 
   if (existsSync(PAUSE)) {
     log.warn('paused (state/PAUSE) — not claiming');

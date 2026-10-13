@@ -40,7 +40,8 @@ export async function scan(): Promise<WatchResult> {
  * The scan's verdict on each ticket it read: claimable, skipped with a reason,
  * or dropped silently (a teammate's). Split from scan() so a test can hand it
  * tickets without the network in front. `me` is this desk's GitLab username,
- * resolved at boot from its own token.
+ * resolved from its own token at boot, or by a later tick when GitLab was not
+ * reachable at boot (recheckIdentity).
  */
 export function triage(issues: Issue[], me: string = gitlabUsername()): WatchResult {
   const L = projectConfig().labels;
@@ -59,7 +60,7 @@ export function triage(issues: Issue[], me: string = gitlabUsername()): WatchRes
       // The account that claims the ticket is the account that will comment,
       // push and merge on it, so an assigned ticket must be assigned to it.
       if (!me) {
-        skipped.push({ iid: issue.iid, why: 'assigned ticket, but this desk has no GitLab identity (npm run token:set)' });
+        skipped.push({ iid: issue.iid, why: 'assigned ticket, but GitLab has not yet answered who this desk is (will retry each tick)' });
         continue;
       }
       // A teammate's ticket is not this desk's board at all: dropped silently,
