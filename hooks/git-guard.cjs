@@ -6,7 +6,7 @@
  * v1 needed this hook to verify a review-approval label before allowing a
  * merge. Oneshot merges from the conductor in TypeScript, so no model holds a
  * merge tool and that half of the guard has nothing to guard. What remains is
- * the Bash surface inside the implement/verify phases, and it is stricter:
+ * the Bash surface inside the ticket session, and it is stricter:
  *
  *   - no force-push, ever, to anything
  *   - no push to a protected branch. 'main' is in that list whatever GitLab
@@ -14,6 +14,7 @@
  *     can_push=true, the server would accept the push and it must still be refused
  *   - no push to any ref other than this run's leased branch
  *   - no deleting protected branches, local or remote
+ *   - no `git stash` other than `list`/`show` (work is set aside as a WIP commit)
  *   - no `git remote set-url` (repointing origin defeats every other rule)
  *   - no `gh` / `glab` CLI, which are unguarded paths to the same operations
  *   - no git command whose working directory is outside the leased worktree.
@@ -22,12 +23,16 @@
  *   - no push at all under DRY_RUN. The dry-run banner promises that every
  *     write is refused, and the SDK's own tool policy cannot make that true on
  *     the Bash surface: a push is just a command there
- *   - no mutating git from a conductor-cwd phase. Those phases hold no leased
- *     worktree, so whatever repo they are standing in is not theirs to change
+ *
+ * The phase checks that used to sit here (a conductor-cwd phase may not mutate
+ * git; a read-only worktree phase may not change the tree) are gone: Solo runs
+ * exactly one session per ticket, in its leased worktree with write scope on
+ * it, so neither condition can arise.
  *
  * `--no-verify` is deliberately ALLOWED: the husky pre-commit hook in these
- * repos is broken locally and aborts every commit. Lint is enforced as a phase
- * gate instead, which is where it can actually be reported.
+ * repos is broken locally and aborts every commit. Lint is enforced instead by
+ * the project pack's PostToolUse lints on every write (hooks/packs/erp/py-lint,
+ * js-standards), which is where it can actually be reported.
  */
 const path = require('node:path');
 const C = require(path.join(__dirname, '_common.cjs'));
@@ -126,65 +131,24 @@ function checkBranchDelete(t, cfg) {
   }
 }
 
-const CONDUCTOR_WRITES = new Set([
-  'push', 'commit', 'merge', 'rebase', 'reset', 'cherry-pick', 'am', 'revert', 'stash', 'apply',
-]);
-
 /**
- * A phase whose cwd is the conductor holds no leased worktree, so there is no
- * repository it has any claim on — the Oneshot root, the context repo and
- * every other checkout on this laptop are all somebody else's. Reads stay
- * open: recall and review both legitimately inspect history. Writes have
- * nowhere legitimate to land, which makes this cheap to refuse and expensive
- * to allow.
+ * `git stash` is banned in a leased worktree. A stash is state the conductor
+ * cannot see: in ticket #8878 a leftover stash/pop sequence reverted commits
+ * and the session blamed a concurrent process. Setting work aside is a WIP
+ * commit on the leased branch; reading the stash list stays allowed.
+ *
+ * Called when the loop's subcommand is `stash`, so the action is the token
+ * after it — which also catches `git -C <dir> stash`, where t[1] is `-C`.
  */
-function checkConductorPhase(t) {
-  if (!C.phase() || leasedWorktree()) return;
-  const sub = t.find((a, i) => i > 0 && !a.startsWith('-') && t[i - 1] !== '-C');
-  const mutating = CONDUCTOR_WRITES.has(sub)
-    || (sub === 'tag' && t.some((a) => a === '-a' || a === '-d' || a === '-f'))
-    || (sub === 'branch' && t.some((a) => a === '-D' || a === '-d' || a === '-m' || a === '--delete'))
-    || (sub === 'checkout' && t.some((a) => a === '-B' || a === '-b'))
-    || (sub === 'switch' && t.some((a) => a === '-c' || a === '-C'));
-  if (!mutating) return;
-  C.event('denied_conductor_git_write', { sub, cmd: t.join(' ') });
+function checkStash(t) {
+  const sub = t[t.indexOf('stash') + 1] || 'push';
+  if (sub === 'list' || sub === 'show') return;
+  C.event('denied_stash', { cmd: t.join(' ') });
   C.deny(
-    `Denied: \`git ${sub}\` from the '${C.phase()}' phase, which runs in the conductor and has ` +
-    'no leased branch or worktree. Whatever repository you are standing in belongs to someone ' +
-    'else. Reads — log, diff, show, rev-parse, status, fetch — are fine; changes are not.',
-  );
-}
-
-const TREE_WRITES = new Set([
-  'commit', 'merge', 'rebase', 'reset', 'cherry-pick', 'am', 'revert', 'stash', 'apply',
-  'checkout', 'switch', 'restore', 'clean', 'rm', 'mv',
-]);
-
-/**
- * A phase that stands in the worktree without the right to write to it —
- * research, plan, testcases, review, ui-evidence, mr — must not reach the
- * files through git either. write-scope.cjs refuses its Edit/Write, and until
- * this check Bash was the way round that: a ui-evidence session ran
- * `git checkout <parent> -- <paths>` in the ticket's own worktree to stage a
- * "before" screenshot, with the fix reverted on disk until it thought to
- * restore it. Had the session died in between, `mr` would have pushed the
- * revert. Push is not in the set: `mr` exists to push commits that implement
- * already made, and checkPush governs where they may go.
- */
-function checkReadOnlyWorktreePhase(t) {
-  const wt = leasedWorktree();
-  if (!C.phase() || !wt) return;
-  const scopes = (process.env.ONESHOT_WRITE_SCOPES || '').split(':').filter(Boolean);
-  if (scopes.some((s) => C.isInside(wt, s))) return;
-  const sub = t.find((a, i) => i > 0 && !a.startsWith('-') && t[i - 1] !== '-C');
-  if (!TREE_WRITES.has(sub)) return;
-  C.event('denied_readonly_worktree_git', { sub, cmd: t.join(' ') });
-  C.deny(
-    `Denied: \`git ${sub}\` from the '${C.phase()}' phase. This phase may read the worktree but ` +
-    'not change it, and git is not a way around that: the files on disk are the change under ' +
-    'review, and anything left altered here can be pushed. If you need the base branch, read it ' +
-    'without touching the checkout — `git show origin/<base>:<path>`, `git diff origin/<base>` — ' +
-    'or say in your output that you could not produce it.',
+    `Denied: \`git stash\` is not available in a leased worktree (${sub}).\n` +
+    'A stash is state nothing else can see, and a leftover one has silently reverted a ' +
+    'run\'s commits before. To set work aside, commit it as WIP on the leased branch ' +
+    '(`git commit -m "wip: …"`) and amend or squash later.',
   );
 }
 
@@ -242,10 +206,9 @@ try {
       if (t[0] !== 'git') continue;
       const sub = t.find((a, i) => i > 0 && !a.startsWith('-') && t[i - 1] !== '-C');
 
-      checkConductorPhase(t);
-      checkReadOnlyWorktreePhase(t);
       if (sub === 'push') checkPush(t, cfg);
       if (sub === 'branch') checkBranchDelete(t, cfg);
+      if (sub === 'stash') checkStash(t);
 
       if (sub === 'remote' && t.includes('set-url')) {
         C.event('denied_remote_seturl', { cmd: seg });

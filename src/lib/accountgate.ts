@@ -55,7 +55,7 @@ export function accountActionRequired(stderr: string): string | null {
 export function accountActionReason(notice: string, iid: number): string {
   return `the Claude account needs a one-time action before any session can start: "${notice}" ` +
     'This is enforced by the SDK\'s bundled Claude Code, not your interactive `claude`, which may ' +
-    'not show it. From the Oneshot repo, with the same credentials the conductor uses, run ' +
-    '`node node_modules/@anthropic-ai/claude-agent-sdk/cli.js` once, accept the notice and exit; ' +
-    `then \`npm run unblock -- ${iid}\`.`;
+    'not show it. Stop the conductor, fix the account, restart it: from the Oneshot repo, with the ' +
+    'same credentials the conductor uses, run `node node_modules/@anthropic-ai/claude-agent-sdk/cli.js` ' +
+    `once, accept the notice and exit; then \`npm start\` — \`npm start -- --ticket ${iid}\` runs this ticket again.`;
 }

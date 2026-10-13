@@ -1,25 +1,33 @@
 /**
- * `npm run doctor` — everything that must be true before a real ticket runs.
+ * `npm run doctor [-- --no-probe]` — everything that must be true before a real ticket runs.
  *
  * Checks are ordered cheapest-first and each is independent, so a failure
  * early does not hide the rest. Exit 1 on any FAIL; WARN never fails the run.
+ *
+ * The last section is the decisive one: a real one-turn session, spawned from
+ * the same queryOptions() a run uses, whose init frame must list the
+ * superpowers plugin and whose SessionStart hook must inject its intro. It
+ * spends one turn on the operator's subscription; `--no-probe` skips it.
  */
-import { existsSync, statSync } from 'node:fs';
+import { query } from '@anthropic-ai/claude-agent-sdk';
+import { accessSync, constants, existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
-  CONTEXT_REPO, PROJECT_TARGET, SKILLS_ROOT, WORK_REPO, WT_ROOT, pathSources, seedFrom,
-  auditAuth, budgetConfig, bugReproductionEnabled, envOr, expandPath, phases, phasesOutsideTarget, portPool,
-  projectConfig, repoIdentity, requiredLabels, reviewersConfig, slackConfig,
+  BASE_ENV, ROOT, STATE, WORK_REPO, WT_ROOT, auditAuth, envOr, mergeMode, pathSources, projectConfig,
+  repoIdentity, requiredLabels, runDir, seedCopies, seedFrom, seedLinks, sessionCaps, sessionModel, superpowersPath,
+  type ProjectConfig,
 } from '../src/lib/config.js';
 import { ping, getBranch, listLabels } from '../src/lib/gitlab.js';
 import {
-  checkoutFindings, identityFindings, relaxRepoChecks, repoCheckOverrideNotice, wtRootFinding, type Finding,
+  checkoutFindings, identityFindings, relaxRepoChecks, repoCheckOverrideNotice, type Finding,
 } from '../src/lib/repocheck.js';
-import { foreignJournalFinding } from '../src/lib/journalproject.js';
-import { slackEnabled, userIdForEmail, userIdForHandle } from '../src/lib/slack.js';
-import { checkIdentity } from '../src/lib/identity.js';
-import { otelStatus, promptTextExported } from '../src/lib/otel.js';
+import { checkIdentity, claudeAccountEmail } from '../src/lib/identity.js';
+import { envDrift } from '../src/lib/envdrift.js';
+import { resolveToken, setupHint } from '../src/lib/token.js';
+import { packManifest } from '../src/ticket/hooks.js';
+import { queryOptions, sessionEnv, type SessionInput } from '../src/ticket/session.js';
+import { atLeast, probeGitlabMcp, sdkInfo } from './verify-deps.js';
 
 let fails = 0;
 let warns = 0;
@@ -44,173 +52,220 @@ function report(f: Finding): void {
   else pass(f.label, f.detail);
 }
 
+/** What the superpowers SessionStart hook injects, and what ONESHOT_SUPERPOWERS_INJECT appends instead. */
+const INTRO_MARK = 'You have superpowers';
+
+/**
+ * What the probe session's frames say about the plugin.
+ *
+ * `hookFired` is read off the SessionStart `hook_response` frames when the CLI
+ * emits any (SDK 0.3.x always emits them for SessionStart): one of them must
+ * carry the intro, because a SessionStart response from a pack hook proves
+ * nothing about superpowers. A CLI that emits none falls back to the intro
+ * appearing in any frame at all.
+ */
+export function probeVerdict(frames: unknown[]): { pluginLoaded: boolean; skillsNamespaced: boolean; hookFired: boolean; cliVersion: string | null } {
+  const sp = superpowersPath() ?? '';
+  let pluginLoaded = false, skillsNamespaced = false, cliVersion: string | null = null;
+  let sessionStartResponses = 0, introInResponse = false, introAnywhere = false;
+  for (const f of frames as Array<Record<string, unknown>>) {
+    if (!f || typeof f !== 'object') continue;
+    if (f.type === 'system' && f.subtype === 'init') {
+      const plugins = (f.plugins as Array<{ path?: string; name?: string }> | undefined) ?? [];
+      pluginLoaded = plugins.some((p) => (sp && p.path === sp) || p.name === 'superpowers');
+      skillsNamespaced = ((f.skills as string[] | undefined) ?? []).some((s) => s.startsWith('superpowers:'));
+      cliVersion = typeof f.claude_code_version === 'string' ? f.claude_code_version : cliVersion;
+    }
+    if (f.type === 'system' && f.subtype === 'hook_response' && f.hook_event === 'SessionStart') {
+      sessionStartResponses += 1;
+      if (`${f.output ?? ''}${f.stdout ?? ''}`.includes(INTRO_MARK)) introInResponse = true;
+    }
+    if (JSON.stringify(f).includes(INTRO_MARK)) introAnywhere = true;
+  }
+  return { pluginLoaded, skillsNamespaced, hookFired: sessionStartResponses ? introInResponse : introAnywhere, cliVersion };
+}
+
+/** The synthetic run the probe and the env assertions use. iid 0 is never a real ticket. */
+function probeInput(): SessionInput {
+  return {
+    iid: 0, runId: 'r-doctor-probe', lap: 0, worktree: ROOT, branch: 'oneshot/ticket-0-probe', port: 0, previousAttempt: false,
+    ticket: { iid: 0, title: 'doctor probe', description: null, labels: [], notes: [], documents: [], externalDocs: [] },
+  };
+}
+
+/** Long enough for a cold plugin load and the MCP spawn; a probe that is still silent after this is wedged. */
+const PROBE_TIMEOUT_MS = 180_000;
+
+/**
+ * One real session with a run's own options, minus the result schema, capped
+ * at one turn and run in this checkout. Never throws: an error comes back with
+ * whatever frames and stderr arrived first.
+ */
+async function runProbe(): Promise<{ frames: unknown[]; stderr: string; error?: string }> {
+  const input = probeInput();
+  const abortController = new AbortController();
+  const frames: unknown[] = [];
+  let stderr = '';
+  // The MCP shim makes state/runs/0/artifacts its cwd; leave no run dir behind.
+  const scratch = runDir(0);
+  const existed = existsSync(scratch);
+  const killer = setTimeout(() => abortController.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const { outputFormat: _schema, ...options } = queryOptions(input, {
+      env: sessionEnv(input), abortController, stderr: (t: string) => { stderr = (stderr + t).slice(-2000); },
+    });
+    const q = query({ prompt: 'Reply with the single word ok.', options: { ...options, maxTurns: 1, cwd: ROOT } });
+    for await (const m of q) frames.push(m);
+    return { frames, stderr };
+  } catch (err) {
+    const why = abortController.signal.aborted ? `no result within ${PROBE_TIMEOUT_MS / 60_000}m` : (err as Error).message;
+    return { frames, stderr, error: why };
+  } finally {
+    clearTimeout(killer);
+    if (!existed) rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/** The existing directory a path would be created under, when it is writable; null otherwise. */
+function writableAncestor(dir: string): string | null {
+  let d = dir;
+  while (!existsSync(d)) {
+    const up = dirname(d);
+    if (up === d) return null;
+    d = up;
+  }
+  try { accessSync(d, constants.W_OK); return d; } catch { return null; }
+}
+
+/**
+ * The core guards src/ticket/hooks.ts registers, read from its source: that
+ * list is the one that runs, so a second copy here could only go stale.
+ */
+function coreGuards(): string[] {
+  const src = readFileSync(join(ROOT, 'src', 'ticket', 'hooks.ts'), 'utf8');
+  return [...new Set([...src.matchAll(/core\('([\w-]+\.cjs)'\)/g)].map((m) => m[1]!))];
+}
+
 async function main(): Promise<void> {
-  console.log('\nOneshot doctor');
+  const noProbe = process.argv.includes('--no-probe');
+  console.log('\nOneshot Solo doctor');
 
   // ------------------------------------------------------------------ auth
   section('Claude auth');
   const auth = auditAuth();
-  if (auth.clean) {
-    pass('no metered-billing credential in the environment', auth.credential);
-  } else {
-    for (const p of auth.problems) fail('auth', p);
-  }
+  if (auth.clean) pass('no metered-billing credential in this shell', auth.credential);
+  else for (const p of auth.problems) fail('auth', p);
   for (const n of auth.notes) warn('auth', n);
-  const claude = spawnSync('which', ['claude'], { encoding: 'utf8' });
-  if (claude.status === 0) pass('claude CLI on PATH', claude.stdout.trim());
-  else warn('claude CLI not on PATH', 'the Agent SDK spawns it — sessions will fail');
+  if (BASE_ENV.CLAUDE_CODE_OAUTH_TOKEN) {
+    pass('signed in', 'CLAUDE_CODE_OAUTH_TOKEN (headless subscription token)');
+  } else {
+    const email = claudeAccountEmail();
+    if (email) pass('signed in to Claude', email);
+    else fail('not signed in to Claude', 'no oauthAccount in ~/.claude.json — run `claude login`');
+  }
 
   // --------------------------------------------------------------- config
   section('Config');
-  // Which project, first: every check below is about it. GITLAB_REPO_URL is the
-  // only thing that says; any legacy selector still in .env is judged against it.
+  const envFile = join(ROOT, '.env');
+  if (!existsSync(envFile)) {
+    warn('no .env', 'run `npm run setup`');
+  } else {
+    const d = envDrift(readFileSync(envFile, 'utf8'), readFileSync(join(ROOT, '.env.example'), 'utf8'));
+    if (d.stale.length) warn('.env sets retired keys', `${d.stale.join(', ')} — Solo reads none of them; delete those lines`);
+    if (d.placeholders.length) warn('.env still holds placeholders', d.placeholders.map((p) => p.key).join(', '));
+    if (!d.stale.length && !d.placeholders.length) {
+      pass('.env against .env.example', d.missing.length
+        ? `${d.missing.length} optional key(s) unset, defaults apply: ${d.missing.map((m) => m.key).join(', ')}`
+        : 'every template key present');
+    }
+  }
+
+  let cfg: ProjectConfig | null = null;
+  try {
+    cfg = projectConfig();
+    pass('config/project.json', `labels "${cfg.labels.entry}" in -> "${cfg.labels.exit}" / "${cfg.labels.inReview}" / `
+      + `"${cfg.labels.blocked}"; base ${cfg.branches.base}; hook pack ${cfg.hookPack ?? 'none'}`);
+    const mode = mergeMode();
+    pass(`merge ${mode}`, mode === 'auto'
+      ? 'the conductor merges when the gate passes (`Loop` is the consent)'
+      : 'runs stop at the MR, labelled "' + cfg.labels.inReview + '"');
+  } catch (err) {
+    fail('config/project.json does not load', (err as Error).message);
+  }
+
+  const caps = sessionCaps();
+  pass('session', `model ${sessionModel()}, ${caps.maxTurns} turns, ${caps.timeoutMin}m timeout, ${caps.idleMin}m idle watchdog`);
+  if (caps.maxTurns < 1 || caps.timeoutMin <= 0) fail('session caps cannot run a session', 'ONESHOT_MAX_TURNS and ONESHOT_TIMEOUT_MIN must be positive');
+  if (caps.idleMin <= 0) warn('idle watchdog off', 'ONESHOT_IDLE_MIN=0 — a silent stream runs out the whole timeout');
+
+  pass('state', STATE);
+  if (envOr('ONESHOT_STATE_DIR')) {
+    warn('ONESHOT_STATE_DIR is set', 'a test-only override: the guard hooks (hooks/_common.cjs) still read '
+      + `${join(ROOT, 'state')}, so a PAUSE file under ${STATE} would not brake a session — unset it`);
+  }
+
+  // Each path says which variable put it there: a surprising directory is only
+  // fixable if the line that chose it is named.
+  const sources = pathSources();
+  const origin = (name: keyof typeof sources): string => {
+    const src = sources[name];
+    if (src.source === 'scoped') return `from ${src.key} — the per-project spelling, still honoured`;
+    if (src.source === 'plain') return `from ${src.key}`;
+    return 'derived from GITLAB_REPO_URL';
+  };
+  // A path that did not resolve is failed under Paths, not printed here.
+  if (WT_ROOT) pass('worktrees', `${WT_ROOT} (${origin('WT_ROOT')})`);
+  const seed = seedFrom() || WORK_REPO;
+  if (seed) pass('seed', `${seed} (${seedFrom() ? origin('ONESHOT_SEED_FROM') : 'WORK_REPO; ONESHOT_SEED_FROM unset'})`);
+
+  // ---------------------------------------------------------------- paths
+  section('Paths');
   // ONESHOT_SKIP_REPO_CHECK turns every repo-check FAIL below into a WARN;
   // said on every run, so the override cannot quietly outlive the problem.
   const override = repoCheckOverrideNotice();
   if (override) warn('repo checks overridden', override);
   for (const f of relaxRepoChecks(identityFindings())) report(f);
   const repo = repoIdentity().repo;
-  const cfg = projectConfig();
-  pass('labels', `"${cfg.labels.entry}" -> "${cfg.labels.exit}", blocked "${cfg.labels.blocked}", ` +
-    (cfg.labels.review
-      ? `optional review gate "${cfg.labels.review}" (off unless a ticket carries it too)`
-      : 'review label: off (labels.review empty)'));
-  if (cfg.labels.testcaseReview) {
-    pass('board label', `"${cfg.labels.testcaseReview}" — on while a ticket sits at the testcases QA gate`);
-  }
-  if (bugReproductionEnabled()) {
-    if (cfg.labels.notABug) {
-      pass('bug reproduction', `on — a bug research cannot reproduce parks for QA, and stops as "${cfg.labels.notABug}" once they approve ` +
-        '(the label must exist on the project)');
-    } else {
-      warn('bug reproduction without a label',
-        'labels.notABug is unset — a run that cannot reproduce its bug still stops and says so, but the ticket gets no label');
-    }
-  } else {
-    pass('bug reproduction', 'off (bugReproduction: false)');
-  }
 
-  // Only ONE run may hold the promotion window at a time, enforced by the
-  // in-process mutex rather than by pinning the whole pipeline to a single
-  // ticket. A sane upper bound is the port pool — every server-holding phase
-  // needs its own port.
-  if (cfg.concurrency < 1 || cfg.concurrency > portPool().length) {
-    fail('concurrency out of range',
-      `must be 1..${portPool().length} (the port pool); the promotion mutex, not this number, ` +
-      'keeps concurrent merges off each other');
-  } else {
-    pass('concurrency', `${cfg.concurrency} — merges serialized by the promotion mutex, ` +
-      `capped at the ${portPool().length}-port pool`);
-  }
-
-  const ph = phases();
-  const codePhases = ph.filter((p) => p.kind === 'code').map((p) => p.name);
-  pass(`${ph.length} phases`, `deterministic: ${codePhases.join(', ')}`);
-  for (const o of phasesOutsideTarget()) {
-    pass(`phase ${o.name} left out for this project`,
-      `targets: ${o.targets.join(', ') || '(none)'}; this project is '${PROJECT_TARGET || '(unset)'}'`);
-  }
-  const missingTier = ph.filter((p) => p.kind === 'session' && !p.tier);
-  if (missingTier.length) fail('phases without a tier', missingTier.map((p) => p.name).join(', '));
-
-  const b = budgetConfig();
-  const phaseSum = Object.values(b.phases).reduce((a, n) => a + n, 0);
-  if (phaseSum > b.ticket_tokens) {
-    warn('phase ceilings exceed the per-ticket ceiling',
-      `${phaseSum} > ${b.ticket_tokens} — the ticket cap binds first`);
-  } else {
-    pass('budgets', `${(b.ticket_tokens / 1e6).toFixed(1)}M weighted/ticket, ${(b.window_tokens / 1e6).toFixed(0)}M/window`);
-  }
-
-  // ---------------------------------------------------------------- paths
-  section('Paths');
-  // Each path says which variable put it there. A plain WORK_REPO beats the
-  // default derived from GITLAB_REPO_URL, and the scoped ONESHOT_<NAME>_<VAR>
-  // beats both, so a surprising directory below is only fixable if the line
-  // that chose it is named. The env var is printed with a failure for the same
-  // reason: SKILLS_ROOT is moved by ONESHOT_SKILLS_ROOT, not by its own name.
-  const sources = pathSources();
-  const origin = (name: keyof typeof sources): string => {
-    const src = sources[name];
-    if (src.source === 'scoped') return `from ${src.key} — the per-project spelling, still honoured`;
-    if (src.source === 'plain') return `from ${src.key}`;
-    return 'default derived from GITLAB_REPO_URL';
-  };
-  for (const [label, p, required, envVar, from] of [
-    ['WORK_REPO', WORK_REPO, true, 'WORK_REPO', origin('WORK_REPO')],
-    ['CONTEXT_REPO', CONTEXT_REPO, false, 'CONTEXT_REPO', ''],
-    ['SKILLS_ROOT', SKILLS_ROOT, false, 'ONESHOT_SKILLS_ROOT', ''],
-  ] as Array<[string, string, boolean, string, string]>) {
-    if (!p) fail(label, `no path — set GITLAB_REPO_URL (default ~/Documents/<name>) or ${envVar}`);
-    else if (existsSync(p)) pass(label, from ? `${p} (${from})` : p);
-    else if (required) fail(label, `${p} does not exist — clone the project there, or set ${envVar}`);
-    else warn(label, `${p} does not exist — set ${envVar}`);
-  }
-
-  if (existsSync(SKILLS_ROOT)) {
-    const skillsDir = join(SKILLS_ROOT, 'skills');
-    if (existsSync(skillsDir)) {
-      const n = spawnSync('sh', ['-c', `ls -1 "${skillsDir}" | wc -l`], { encoding: 'utf8' });
-      pass('skills discovered', `${n.stdout.trim()} in ${skillsDir}`);
-    } else warn('no skills/ under SKILLS_ROOT', skillsDir);
-  }
-
-  if (!WT_ROOT) fail('WT_ROOT', 'no path — set GITLAB_REPO_URL (default ~/Documents/<name>-wt) or WT_ROOT');
-  else if (existsSync(WT_ROOT)) {
-    if (statSync(WT_ROOT).isDirectory()) pass('WT_ROOT', `${WT_ROOT} (${origin('WT_ROOT')})`);
-  } else warn('WT_ROOT will be created on first run', `${WT_ROOT} (${origin('WT_ROOT')})`);
-  // A plain WT_ROOT beats the derived default, so a line left over from another
-  // project wins and nothing else would notice. Judged only against a project:
-  // with GITLAB_REPO_URL unusable (Config says so) there is none to compare with.
-  const shared = repo ? wtRootFinding(WT_ROOT, sources.WT_ROOT, PROJECT_TARGET) : null;
-  if (shared) for (const f of relaxRepoChecks([shared])) report(f);
-
-  // The seed repo is read when a worktree is leased, not at boot, so an absent
-  // one is silent until phase 3 and only *hurts* at phase 6, where `verify`
-  // needs a runnable app. That is exactly the "confusing failure three phases
-  // in" this script exists to pull forward.
-  const seed = seedFrom();
-  if (!seed) {
-    warn('no seed repo configured', 'set ONESHOT_SEED_FROM — without it a leased worktree has '
-      + 'no node_modules/venv, so `verify` cannot run the app');
-  } else if (!existsSync(seed)) {
-    warn('seed repo does not exist', `${seed} — set ONESHOT_SEED_FROM to a repo that is `
-      + 'already installed (node_modules, venv)');
-  } else {
-    const links = envOr('ONESHOT_SEED_LINKS', '').split(',').map((s) => s.trim()).filter(Boolean);
-    const copies = envOr('ONESHOT_SEED_COPIES', '').split(',').map((s) => s.trim()).filter(Boolean);
-    const missing = [...links, ...copies].filter((rel) => !existsSync(join(seed, rel)));
-    if (missing.length) warn('seed entries missing from the seed repo', missing.join(', '));
-    else pass('seed repo', `${seed} (${links.length} linked, ${copies.length} copied; ${origin('ONESHOT_SEED_FROM')})`);
-  }
+  if (!WORK_REPO) fail('WORK_REPO', 'no path — set GITLAB_REPO_URL (default ~/Documents/<name>) or WORK_REPO');
+  else if (existsSync(WORK_REPO)) pass('WORK_REPO', `${WORK_REPO} (${origin('WORK_REPO')})`);
+  else fail('WORK_REPO', `${WORK_REPO} does not exist — clone the project there, or set WORK_REPO`);
 
   // A clone of some other project would cut every worktree from the wrong code
-  // while tickets and MRs went to the right one — and the seed is not only
-  // borrowed from: scripts/app.cjs fetches MR refs in it and cuts app worktrees
-  // from it. A different project path fails and the same path on another host
-  // only warns, so an ssh origin matches an https URL and erp never matches
-  // erp-archive. The same call boot and preflight make.
-  if (repo) {
-    for (const f of relaxRepoChecks(checkoutFindings({ workRepo: WORK_REPO, seed, sources }))) report(f);
-    // Journals are keyed by iid alone, so another project's are never resumed;
-    // they are still worth knowing about.
-    const foreignRuns = foreignJournalFinding();
-    if (foreignRuns) report(foreignRuns);
+  // while tickets and MRs went to the right one. The same call boot makes.
+  if (repo) for (const f of relaxRepoChecks(checkoutFindings({ workRepo: WORK_REPO, seed: seedFrom(), sources }))) report(f);
+
+  if (!WT_ROOT) {
+    fail('WT_ROOT', 'no path — set GITLAB_REPO_URL (default ~/Documents/<name>-wt) or WT_ROOT');
+  } else if (existsSync(WT_ROOT)) {
+    if (!statSync(WT_ROOT).isDirectory()) fail('WT_ROOT is not a directory', WT_ROOT);
+    else if (writableAncestor(WT_ROOT) !== WT_ROOT) fail('WT_ROOT is not writable', WT_ROOT);
+    else pass('WT_ROOT writable', WT_ROOT);
   } else {
-    warn('checkouts not checked', 'there is no project to compare WORK_REPO, the seed, WT_ROOT or the run '
-      + 'journals with until GITLAB_REPO_URL is fixed (see Config)');
+    const under = writableAncestor(WT_ROOT);
+    if (under) pass('WT_ROOT will be created on first run', `${WT_ROOT} (under ${under})`);
+    else fail('WT_ROOT cannot be created', `${WT_ROOT} — no writable parent directory`);
   }
 
-  const ports = portPool();
-  if (ports.length) pass('port pool', ports.join(', '));
-  else fail('port pool is empty', 'phases needing a dev server cannot run');
+  // Read when a worktree is leased, not at boot: an absent entry is silent
+  // until the app will not start mid-session. This pulls it forward.
+  if (!seed || !existsSync(seed)) {
+    warn('no seed repo', `${seed || '(no path)'} — a leased worktree gets no node_modules/venv, so the app cannot run in it`);
+  } else if (cfg) {
+    const links = seedLinks();
+    const copies = seedCopies();
+    const missing = [...links, ...copies].filter((rel) => !existsSync(join(seed, rel)));
+    if (missing.length) warn('seed entries missing from the seed repo', `${missing.join(', ')} under ${seed} — every worktree will lack them`);
+    else pass('seed entries present', `${links.length} linked, ${copies.length} copied from ${seed}`);
+  }
 
   // --------------------------------------------------------------- gitlab
   section('GitLab');
-  if (!envOr('GITLAB_TOKEN')) {
-    fail('GITLAB_TOKEN unset', 'cp .env.example .env and fill it in');
-  } else if (!repo) {
-    warn('GitLab not checked', 'there is no project to ask about until GITLAB_REPO_URL is fixed (see Config)');
+  const token = resolveToken();
+  if (!token.token) {
+    fail('no GitLab token for this desk', setupHint().split('\n')[0]);
+  } else if (!repo || !cfg) {
+    warn('GitLab not checked', 'there is no project to ask about until GITLAB_REPO_URL and config/project.json load (above)');
   } else {
     const p = await ping();
     if (p.ok) {
@@ -230,18 +285,18 @@ async function main(): Promise<void> {
       } else if (idc.token.bot) {
         pass('acts as a bot', `${idc.token.username} — cannot be mistaken for a reviewer`);
       } else {
-        pass('acts as itself', `${idc.token.username}, token from ${idc.token.source.source}`);
+        pass('acts as itself', `${idc.token.username}, token from ${idc.token.source.where}`);
       }
       if (idc.warning && !idc.token?.source.shared) warn('identity', idc.warning.split('\n')[0] ?? '');
-      // Each branch is fetched by name. Listing them returns one page of 100,
-      // and a project with more branches than that hides `dev` off the page.
+
+      // Each branch is fetched by name: a listing returns one page of 100, and
+      // a project with more branches than that hides the base off the page.
       const wanted = [...new Set([cfg.branches.base, ...cfg.branches.protected])];
       const branch = new Map(await Promise.all(wanted.map(async (n) => [n, await getBranch(n)] as const)));
       const base = branch.get(cfg.branches.base);
       if (base?.ok && base.data) pass('base branch exists', cfg.branches.base);
       else if (base?.status === 404) fail('base branch missing', cfg.branches.base);
       else warn('base branch not checked', base?.error ?? `HTTP ${base?.status ?? '?'}`);
-
       for (const prot of cfg.branches.protected) {
         const found = branch.get(prot);
         if (found?.status === 404) { warn(`protected branch '${prot}' not found`, 'listed in config but absent'); continue; }
@@ -250,25 +305,19 @@ async function main(): Promise<void> {
         else pass(`'${prot}' protected`);
       }
 
-      // Every label this harness acts on, checked against the ones that exist.
-      //
-      // Each of these is matched by NAME and nothing raises when a name does
-      // not match: a swap writes a label the board never shows, and a
-      // `labelSkills` pair quietly stops routing, so the phase runs without
-      // the method it was configured to have. An absent label on a TICKET is
-      // an answer; a configured label absent from the PROJECT is a typo that
-      // no run will ever report.
-      const lb = await listLabels();
-      if (!lb.ok || !lb.data) {
-        warn('labels not verified', `could not list project labels (${lb.kind} HTTP ${lb.status})`);
-      } else {
-        const defined = new Set(lb.data.map((l) => l.name));
-        const needed = requiredLabels(cfg.labels, phases(), bugReproductionEnabled());
-        const absent = needed.filter((l) => !defined.has(l.name));
-        if (!absent.length) pass('every configured label exists on the project', `${needed.length} checked`);
-        for (const { name, why } of absent) {
-          fail(`label '${name}' does not exist on the project`, `${why} — it will never match, and nothing will say so`);
-        }
+      // Every label the conductor acts on is matched by NAME, and nothing
+      // raises when a name does not match: a swap writes a label the board
+      // never shows. A configured label absent from the project is a typo no
+      // run will ever report. Asked for by name: one unfiltered page of 100
+      // does not reach every label of a project that defines hundreds.
+      const needed = requiredLabels(cfg);
+      const found = await Promise.all(needed.map(async (l) => [l, await listLabels(l.name)] as const));
+      const unverified = found.filter(([, r]) => !r.ok || !r.data);
+      const absent = found.filter(([l, r]) => r.ok && r.data && !r.data.some((d) => d.name === l.name)).map(([l]) => l);
+      for (const [l, r] of unverified) warn(`label '${l.name}' not verified`, `could not list project labels (${r.kind} HTTP ${r.status})`);
+      if (!absent.length && !unverified.length) pass('every configured label exists on the project', needed.map((l) => l.name).join(', '));
+      for (const { name, why } of absent) {
+        fail(`label '${name}' does not exist on the project`, `${why} — it will never match, and nothing will say so`);
       }
     } else if (p.kind === 'auth') {
       fail('GitLab refused the token', `HTTP ${p.status} — needs scope 'api'`);
@@ -281,107 +330,98 @@ async function main(): Promise<void> {
 
   // ---------------------------------------------------------------- hooks
   section('Guardrails');
-  // Guards are passed to the SDK in-process (src/conductor/hooks.ts), so there
-  // is nothing to install and nothing in settings.json to check. What matters
-  // is that the .cjs files exist and still enforce what they claim to.
-  const guards = ['pause-check', 'write-scope', 'git-guard', 'budget-gate', 'log-event', '_common'];
-  const missing = guards.filter((g) => !existsSync(join(process.cwd(), 'hooks', `${g}.cjs`)));
-  missing.length
-    ? fail('guard scripts missing', missing.join(', '))
-    : pass(`${guards.length} guard scripts present`, 'loaded in-process, no install step');
+  // Guards are passed to the SDK in-process (src/ticket/hooks.ts): nothing to
+  // install, nothing in settings.json to check. What matters is that the .cjs
+  // files exist and still enforce what they claim to.
+  const core = coreGuards();
+  const missingCore = ['_common.cjs', ...core].filter((g) => !existsSync(join(ROOT, 'hooks', g)));
+  if (!core.length) fail('no core guard registrations found', 'src/ticket/hooks.ts');
+  else if (missingCore.length) fail('core guard scripts missing', missingCore.join(', '));
+  else pass(`${core.length} core guards present`, core.map((g) => g.replace(/\.cjs$/, '')).join(', '));
 
-  const verify = spawnSync('bash', ['scripts/verify-hooks.sh'], { encoding: 'utf8' });
-  if (verify.status === 0) {
-    const last = verify.stdout.trim().split('\n').pop() ?? '';
-    pass('guard test suite', last.replace(/\x1b\[[0-9;]*m/g, ''));
+  const pack = cfg?.hookPack;
+  if (!pack) {
+    pass('no hook pack', 'config/project.json hookPack is unset — core guards only');
   } else {
-    fail('guard test suite failed',
-      'run: npm run hooks:verify — note an absent SKILLS_ROOT fails its symlink test on its '
-      + 'own, so this and the path check above are usually one cause, not two');
-  }
-
-  // ------------------------------------------------------------ telemetry
-  section('Session tracking (Langfuse)');
-  const otel = otelStatus();
-  if (!otel.on) {
-    warn('telemetry OFF', otel.why);
-  } else {
-    if (otel.remote) warn('telemetry ON, endpoint is remote', otel.why);
-    else pass('telemetry ON', otel.why);
-
-    if (otel.why.includes('+responses')) {
-      pass('assistant responses saved', '~0.5-1.5 MB/ticket — output only, never replayed');
-    }
-    if (promptTextExported()) {
-      fail('prompt TEXT export is enabled',
-        'prompts replay the whole conversation every turn: ~30-60 MB/ticket, and a full ' +
-        'unredacted copy of every ticket body and diff. Set logUserPrompts:false.');
+    try {
+      const hooks = packManifest(pack);
+      const absent = hooks.filter((h) => !existsSync(join(ROOT, 'hooks', 'packs', pack, h.script))).map((h) => h.script);
+      if (absent.length) fail(`hook pack '${pack}' names missing scripts`, absent.join(', '));
+      else pass(`hook pack '${pack}'`, `${hooks.length} hooks, every script present`);
+    } catch (err) {
+      fail(`hook pack '${pack}' does not load`, (err as Error).message);
     }
   }
 
-  // ---------------------------------------------------------------- slack
-  section('Slack');
-  if (!envOr('SLACK_BOT_TOKEN')) warn('SLACK_BOT_TOKEN unset', 'status stays on the console');
-  else pass('bot token present');
-  if (!slackConfig().channel) warn('no channel configured', 'set ONESHOT_CHANNEL or config/slack.json');
-  else pass('channel', slackConfig().channel);
-  if (!slackConfig().allowlist.length) warn('command allowlist is empty', 'every Slack command will be refused');
-  // Only where the gates could actually run: an install with no Slack, or no
-  // Review label configured, cannot hit this and does not need a standing
-  // warning telling it so on every doctor run.
-  //
-  // There is deliberately NO check here for channels:history/groups:history.
-  // An earlier version of the gates read their verdict out of the ticket's
-  // Slack thread and this block FAILED without that scope; they read GitLab
-  // now (src/conductor/reviewgate.ts), so the scope is dead and demanding it
-  // sent people to the Slack console to fix a non-problem. See
-  // config/slack.json's _comment_history.
-  const allRuns = cfg.reviewAllRuns === true;
-  if (slackEnabled() && (cfg.labels.review || allRuns)) {
-    // The gates @mention the owning group when they arm. Resolve every name
-    // for real rather than checking that config looks plausible: an
-    // unresolvable reviewer fails silently — the ask posts unaddressed and
-    // they never learn they are being waited on.
-    const { dev, qa, design, emailDomain, slackIds } = reviewersConfig();
-    const names = [...new Set([...dev, ...qa, ...design])];
-    if (names.length) {
-      // A pinned id is trusted at runtime without a lookup, so this is the
-      // only place it is ever checked. Verify it against the live workspace
-      // rather than merely that it is present: a stale or mistyped id does
-      // not fail loudly, it @mentions somebody else, and the run still waits
-      // on a person who was never asked.
-      const wrong: string[] = [];
-      for (const [u, id] of Object.entries(slackIds)) {
-        const live = await userIdForHandle(u);
-        if (live && live !== id) wrong.push(`${u} pinned ${id} but @${u} is ${live}`);
-      }
-      if (wrong.length) {
-        fail('a pinned Slack id does not match that person',
-          `${wrong.join('; ')} — config/reviewers.json would @mention the wrong person`);
-      } else if (Object.keys(slackIds).length) {
-        pass('pinned Slack ids agree with the workspace', `${Object.keys(slackIds).length} checked`);
-      }
+  const verify = spawnSync('bash', [join(ROOT, 'scripts', 'verify-hooks.sh')], { encoding: 'utf8', cwd: ROOT });
+  const last = (verify.stdout ?? '').trim().split('\n').pop()?.replace(/\x1b\[[0-9;]*m/g, '') ?? '';
+  if (verify.status === 0) pass('guard test suite', last);
+  else fail('guard test suite failed', `${last} — run: npm run hooks:verify`);
 
-      const resolved = await Promise.all(names.map(async (u) => {
-        if (slackIds[u]) return [u, 'pinned'] as const;
-        if (await userIdForHandle(u)) return [u, 'handle'] as const;
-        if (emailDomain && await userIdForEmail(`${u}@${emailDomain}`)) return [u, 'email'] as const;
-        return [u, null] as const;
-      }));
-      const missing = resolved.filter(([, via]) => !via).map(([u]) => u);
-      const viaPinned = resolved.filter(([, via]) => via === 'pinned').length;
-      if (!missing.length) {
-        pass('reviewer Slack mentions', `${names.length} resolved (${viaPinned} pinned)`);
-      } else if (missing.length === names.length) {
-        warn('no reviewer resolves to a Slack id',
-          'the bot token needs users:read (handle lookup) or users:read.email. Approval '
-          + 'requests still post to the channel, unaddressed.');
+  // hooks/_common.cjs exits 0 without ONESHOT_PHASE, so a session env without
+  // it runs every guard as a no-op. And the env is an allowlist: no API key,
+  // no GitLab token (that reaches only the MCP server).
+  const env = sessionEnv(probeInput());
+  if (env.ONESHOT_PHASE === 'ticket') pass('session env sets ONESHOT_PHASE=ticket', 'every guard is a no-op without it');
+  else fail('session env lacks ONESHOT_PHASE=ticket', 'every guard would exit 0 and allow everything');
+  const credentialKey = /^(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|CLAUDE_CODE_USE_\w+|GITLAB_TOKEN|GITLAB_PERSONAL_ACCESS_TOKEN|ONESHOT_GITLAB_TOKEN)$/;
+  const leaked = Object.keys(env).filter((k) => credentialKey.test(k));
+  if (token.token.length >= 8 && Object.values(env).some((v) => v.includes(token.token))) leaked.push('the GitLab token value');
+  if (leaked.length) fail('session env carries a credential', leaked.join(', '));
+  else pass('session env holds no API key or GitLab token');
+
+  // ------------------------------------------------------------------ sdk
+  section('SDK');
+  const sdk = sdkInfo();
+  if (!sdk.sdkVersion) fail('agent SDK not installed', 'npm install with the VPN OFF');
+  if (!sdk.cliVersion) fail('bundled Claude Code version unreadable', 'node_modules/@anthropic-ai/claude-agent-sdk/manifest.json');
+  else if (!atLeast(sdk.cliVersion, 2, 1)) fail(`bundled Claude Code ${sdk.cliVersion} is older than 2.1`, 'superpowers assumes 2.1 hook behaviour — npm install');
+  else pass(`bundled Claude Code ${sdk.cliVersion}`, `agent SDK ${sdk.sdkVersion ?? '?'}`);
+  if (sdk.binaryPresent) pass('native binary present', sdk.platformPackage);
+  else fail('native binary missing', `${sdk.platformPackage} — npm install with the VPN OFF`);
+  report(await probeGitlabMcp());
+
+  // ---------------------------------------------------------- superpowers
+  section(`Superpowers ${D}(the probe is a real 1-turn session on your subscription; --no-probe skips it)${X}`);
+  const sp = superpowersPath();
+  const spUsable = !!sp && existsSync(join(sp, 'skills', 'brainstorming', 'SKILL.md'));
+  if (!sp) fail('superpowers not installed', '`claude plugin install superpowers`, or set ONESHOT_SUPERPOWERS_PATH');
+  else if (!spUsable) fail('superpowers dir has no skills/brainstorming/SKILL.md', `${sp} — set ONESHOT_SUPERPOWERS_PATH or fix the plugin dir`);
+  else pass('plugin dir', `${sp}${envOr('ONESHOT_SUPERPOWERS_PATH') ? ' (from ONESHOT_SUPERPOWERS_PATH)' : ''}`);
+  const inject = envOr('ONESHOT_SUPERPOWERS_INJECT') === '1';
+  if (inject && sp && !existsSync(join(sp, 'skills', 'using-superpowers', 'SKILL.md'))) {
+    fail('ONESHOT_SUPERPOWERS_INJECT=1 but there is no intro to inject', `${sp}/skills/using-superpowers/SKILL.md is missing`);
+  }
+
+  if (noProbe) {
+    console.log(`  ${D}SKIP  probe session (--no-probe)${X}`);
+  } else if (spUsable) {
+    const probe = await runProbe();
+    const v = probeVerdict(probe.frames);
+    const init = (probe.frames as Array<Record<string, unknown>>).find((f) => f?.type === 'system' && f.subtype === 'init');
+    const result = (probe.frames as Array<Record<string, unknown>>).find((f) => f?.type === 'result');
+    if (probe.error || !result) {
+      fail('probe session did not finish', `${probe.error ?? 'no result frame'}${probe.stderr ? ` — ${probe.stderr.trim().slice(-300)}` : ''}`);
+    }
+    if (init) {
+      const errs = ((init.plugin_errors as Array<{ plugin?: string; type?: string; message?: string }> | undefined) ?? [])
+        .map((e) => `${e.plugin ?? '?'}: ${e.type ?? '?'} ${e.message ?? ''}`.trim());
+      if (v.pluginLoaded) pass('plugin loaded', 'the init frame lists superpowers');
+      else fail('plugin did not load', `set ONESHOT_SUPERPOWERS_PATH or fix the plugin dir${errs.length ? ` — ${errs.join('; ')}` : ''}`);
+      if (v.skillsNamespaced) pass('skills namespaced', 'superpowers:* skills are in the session');
+      else warn('no superpowers:* skill in the session', 'the prompt names superpowers:brainstorming and superpowers:writing-plans');
+      if (v.hookFired && inject) {
+        warn('SessionStart hook fired AND ONESHOT_SUPERPOWERS_INJECT=1', 'the intro reaches the session twice — remove ONESHOT_SUPERPOWERS_INJECT from .env');
+      } else if (v.hookFired) {
+        pass('SessionStart hook fired', `"${INTRO_MARK}" was injected`);
+      } else if (inject) {
+        pass('SessionStart hook did not fire; fallback on', 'ONESHOT_SUPERPOWERS_INJECT=1 appends the intro to the system prompt');
       } else {
-        warn(`reviewers not reachable on Slack: ${missing.join(', ')}`,
-          'no workspace account whose handle matches the GitLab username'
-          + (emailDomain ? `, and no <name>@${emailDomain}` : '')
-          + ' — they will not be @mentioned when a gate waits on them');
+        warn('SessionStart hook did not fire', 'add ONESHOT_SUPERPOWERS_INJECT=1 to .env — the intro will be appended to the system prompt instead');
       }
+      pass('session CLI', `claude ${v.cliVersion ?? '?'}${result ? `, result ${String(result.subtype)} in ${String(result.num_turns)} turn(s)` : ''}`);
+    } else if (!probe.error && result) {
+      fail('plugin not verified', 'the probe session emitted no system/init frame');
     }
   }
 
@@ -390,7 +430,9 @@ async function main(): Promise<void> {
   process.exit(fails ? 1 : 0);
 }
 
-main().catch((err) => {
-  console.error(`\n${R}doctor crashed${X}: ${(err as Error).message}\n`);
-  process.exit(1);
-});
+if (process.argv[1]?.endsWith('doctor.ts')) {
+  main().catch((err) => {
+    console.error(`\n${R}doctor crashed${X}: ${(err as Error).message}\n`);
+    process.exit(1);
+  });
+}

@@ -43,12 +43,11 @@ type Config = Record<string, unknown> & {
   WORK_REPO: string;
   WT_ROOT: string;
   seedFrom: () => string;
-  scopedEnvName: (n: string) => string;
   projectConfig: () => {
-    gitlab: Record<string, unknown>;
     labels: Record<string, unknown>;
     branches: { base: string };
   };
+  gitlabRepo: () => Record<string, unknown>;
   repoIdentity: () => { repo: { project: string } | null; error: string | null };
   pathSources: () => Record<string, { path: string; source: string; key: string }>;
   projectSessionEnv: () => Record<string, string>;
@@ -91,11 +90,10 @@ test('without GITLAB_REPO_URL, importing works and nothing names a project', asy
     assert.equal(m.WORK_REPO, '');
     assert.equal(m.WT_ROOT, '');
     assert.equal(m.seedFrom(), '');
-    assert.equal(m.scopedEnvName('WORK_REPO'), '');
     // Labels and branches stay readable: only asking which project throws.
     const cfg = m.projectConfig();
     assert.equal(cfg.labels.entry, 'Loop');
-    assert.throws(() => cfg.gitlab, /GITLAB_REPO_URL is not set.*e\.g\. GITLAB_REPO_URL=/);
+    assert.throws(() => m.gitlabRepo(), /GITLAB_REPO_URL is not set.*e\.g\. GITLAB_REPO_URL=/);
     assert.match(m.repoIdentity().error ?? '', /GITLAB_REPO_URL is not set/);
   });
 });
@@ -103,14 +101,14 @@ test('without GITLAB_REPO_URL, importing works and nothing names a project', asy
 test('an invalid URL is not an import-time crash either; asking which project is', async () => {
   await loadWith({ GITLAB_REPO_URL: 'https://gitlab.example.com/erp' }, (m) => {
     assert.equal(m.PROJECT_TARGET, '');
-    assert.throws(() => m.projectConfig().gitlab, /GITLAB_REPO_URL='https:\/\/gitlab\.example\.com\/erp' is not a GitLab project URL/);
+    assert.throws(() => m.gitlabRepo(), /GITLAB_REPO_URL='https:\/\/gitlab\.example\.com\/erp' is not a GitLab project URL/);
   });
 });
 
 test('the URL alone sets the project, its API, and every derived path', async () => {
   await loadWith({ GITLAB_REPO_URL: REPO_URL }, (m) => {
     assert.equal(m.PROJECT_TARGET, 'erp');
-    const { gitlab } = m.projectConfig();
+    const gitlab = m.gitlabRepo();
     assert.equal(gitlab.project, 'acme/erp');
     assert.equal(gitlab.host, 'gitlab.example.com');
     assert.equal(gitlab.apiUrl, 'https://gitlab.example.com/api/v4');
@@ -131,11 +129,9 @@ test('the URL alone sets the project, its API, and every derived path', async ()
 test('the name follows whatever project the URL names — no project is built in', async () => {
   await loadWith({ GITLAB_REPO_URL: 'git@gitlab.example.com:acme/platform/Billing-Service.git' }, (m) => {
     assert.equal(m.PROJECT_TARGET, 'billing-service');
-    assert.equal(m.projectConfig().gitlab.project, 'acme/platform/Billing-Service');
+    assert.equal(m.gitlabRepo().project, 'acme/platform/Billing-Service');
     assert.equal(m.WORK_REPO, docs('billing-service'));
     assert.equal(m.WT_ROOT, docs('billing-service-wt'));
-    assert.equal(m.scopedEnvName('WORK_REPO'), 'ONESHOT_BILLING_SERVICE_WORK_REPO');
-    assert.equal(m.scopedEnvName('ONESHOT_SEED_FROM'), 'ONESHOT_BILLING_SERVICE_SEED_FROM');
   });
 });
 
@@ -148,18 +144,6 @@ test('the base config is the ERP one: its labels, its base branch', async () => 
     assert.equal(labels.exit, 'Merged');
     assert.equal(labels.blocked, 'Needs Human');
     assert.equal(labels.inReview, 'In Review');
-    // On, and spelled exactly as the project spells it: 'TestCase Review' exists
-    // there (id 1342, created after the move to ERP), and the board-only marker
-    // for the testcases gate is a no-op while this is empty — `boardLabel` maps
-    // '' to null, which silently disables BOTH the add and the remove.
-    assert.equal(labels.testcaseReview, 'TestCase Review');
-    // The rest are off, rather than pointing at a name the project does not have.
-    // 'Review' does exist on ERP, but it is deliberately left off: unlike the
-    // board markers it adds three human sign-off pauses, so switching it on is a
-    // behaviour change and not a labelling one.
-    for (const off of ['review', 'notABug', 'designReview']) {
-      assert.equal(labels[off], '', off);
-    }
     assert.equal(branches.base, 'dev');
   });
 });
@@ -213,7 +197,7 @@ test('a legacy selector moves nothing', async () => {
     ONESHOT_PROJECT_ID: '1',
   }, (m) => {
     assert.equal(m.PROJECT_TARGET, 'erp');
-    const { gitlab } = m.projectConfig();
+    const gitlab = m.gitlabRepo();
     assert.equal(gitlab.project, 'acme/erp');
     assert.equal(gitlab.apiUrl, 'https://gitlab.example.com/api/v4');
     assert.equal(m.WORK_REPO, docs('erp'));
@@ -224,7 +208,7 @@ test('without a URL, a legacy selector does not stand in for one', async () => {
   await loadWith({ ONESHOT_PROJECT: 'erp', ONESHOT_GITLAB_PROJECT: 'acme/erp' }, (m) => {
     assert.equal(m.PROJECT_TARGET, '');
     assert.equal(m.WORK_REPO, '');
-    assert.throws(() => m.projectConfig().gitlab, /GITLAB_REPO_URL is not set/);
+    assert.throws(() => m.gitlabRepo(), /GITLAB_REPO_URL is not set/);
   });
 });
 

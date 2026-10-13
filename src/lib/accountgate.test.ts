@@ -86,6 +86,8 @@ test('the reason names the notice, the bundled CLI and the way back', () => {
   const why = accountActionReason(NOTICE, 4242);
   assert.match(why, /review the updated terms/);
   assert.match(why, /claude-agent-sdk\/cli\.js/);
-  assert.match(why, /npm run unblock -- 4242/);
+  assert.match(why, /stop the conductor, fix the account, restart it/i);
+  assert.match(why, /npm start -- --ticket 4242/);
+  assert.doesNotMatch(why, /npm run unblock/, 'Solo has no unblock script');
   assert.doesNotMatch(why, /168/);
 });

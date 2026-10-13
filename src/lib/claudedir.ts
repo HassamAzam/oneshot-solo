@@ -1,20 +1,19 @@
 /**
- * The `.claude` directory a phase session can actually read.
+ * The `.claude` directory the ticket session can actually read.
  *
  * Sessions are spawned with `settingSources: ['project']`, so the only place a
  * skill, agent or rule can come from is a `.claude` directory in the session's
- * cwd. Worktree phases had one — seed() symlinked the whole of the context
- * repo's `.claude` into the worktree — but conductor-cwd phases (recall, qa,
- * demo, document, memorize) run in the Oneshot repo root, which had no
- * `.claude` at all. Every skill their prompts named silently failed to resolve:
- * the recorded run-5 transcripts show the recall session listing eight built-in
- * slash commands and not one project skill, while the worktree sessions listed
- * forty-two. Nothing errored. The phase did the work from the prompt alone and
- * the loss was invisible from outside.
+ * cwd: the leased worktree (and the conductor root, which boot composes the
+ * same way). A skill the prompt names that is not there silently fails to
+ * resolve — oneshot's recorded run-5 transcripts show a session with no
+ * composed `.claude` listing eight built-in slash commands and not one project
+ * skill, while sessions that had one listed forty-two. Nothing errored. The
+ * session did the work from the prompt alone and the loss was invisible from
+ * outside.
  *
- * A whole-dir symlink cannot fix that, because the pipeline skills
- * (local-browser-verify, ui-evidence-pack, self-remediation) describe THIS
- * system and live in THIS repo — a fresh
+ * A whole-dir symlink of the context repo's `.claude` cannot do it, because the
+ * pipeline skills (ship-ticket, local-browser-verify, …) describe THIS system
+ * and live in THIS repo — a fresh
  * clone has to carry them, and writing them into the context repo would make
  * Oneshot's own method something you have to remember to install next to it. So
  * `.claude` is composed instead: a real directory whose `skills/` holds one
@@ -36,12 +35,16 @@
 import {
   existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { ROOT, SKILLS_ROOT } from './config.js';
 import { log } from './log.js';
 
-/** Subdirectories taken whole from the context repo — no Oneshot equivalent exists. */
-const LINKED_SUBDIRS = ['agents', 'rules'] as const;
+/**
+ * Subdirectories taken whole from the context repo — no Oneshot equivalent
+ * exists. `agents/` is not one of them: it is composed per file so that
+ * EXCLUDED_AGENTS can apply (see linkAgents()).
+ */
+const LINKED_SUBDIRS = ['rules'] as const;
 
 /**
  * Context-repo skills that must not reach a phase, and why each one is here.
@@ -64,7 +67,18 @@ const EXCLUDED_SKILLS = new Map<string, string>([
     'nor the work repo; the sandbox ships graphify-manifest.json as an explicit stub and the ' +
     'real bundle only arrives via the interactive /get-graphify command, which nothing here ' +
     'runs. Research spent its whole turn budget establishing that absence twice.'],
+  ['planning-methodology',
+    'stops and waits for a human to approve the plan. A Solo session plans with ' +
+    'superpowers writing-plans and has nobody to wait for, so it would idle out its budget.'],
 ]);
+
+/**
+ * Context-repo agents a Solo session must not delegate to, by name (the file
+ * is `<name>.md`). Both stop for a human's approval before going on — the
+ * planner after its plan, the orchestrator between the agents it dispatches —
+ * and nobody is watching a Solo session to give it.
+ */
+const EXCLUDED_AGENTS = new Set(['planner-agent', 'orchestrator-agent']);
 
 function isSymlink(path: string): boolean {
   try { return lstatSync(path).isSymbolicLink(); } catch { return false; }
@@ -123,6 +137,31 @@ function unlinkExcluded(dir: string): void {
   }
 }
 
+/**
+ * Compose `into` as a real directory holding one link per agent file under
+ * `from`, minus EXCLUDED_AGENTS.
+ *
+ * A whole-dir link at `into` is what this repo composed before agents were
+ * taken per file, so it is replaced; a link to an excluded agent is removed for
+ * the same reason unlinkExcluded() removes skills. A real file is a human's and
+ * is left alone, as everywhere in this file.
+ */
+function linkAgents(from: string, into: string): void {
+  if (!isDirectory(from)) return;
+  if (isSymlink(into)) rmSync(into, { force: true });
+  mkdirSync(into, { recursive: true });
+  pruneDangling(into);
+  for (const name of readdirSync(from)) {
+    if (name.startsWith('.')) continue;
+    const entry = join(into, name);
+    if (EXCLUDED_AGENTS.has(name.replace(/\.md$/, ''))) {
+      if (isSymlink(entry)) rmSync(entry, { force: true });
+      continue;
+    }
+    relink(entry, join(from, name));
+  }
+}
+
 /** Link every skill directory under `from` whose name is not already claimed. */
 function linkSkills(from: string, into: string, claimed: Set<string>): void {
   if (!isDirectory(from)) return;
@@ -170,6 +209,7 @@ export function ensureClaudeDir(repoRoot: string): string[] {
       const src = join(SKILLS_ROOT, sub);
       if (isDirectory(src)) relink(join(dotClaude, sub), src);
     }
+    linkAgents(join(SKILLS_ROOT, 'agents'), join(dotClaude, 'agents'));
 
     const claimed = new Set<string>();
     linkSkills(contextSkills, skills, claimed);
@@ -182,4 +222,34 @@ export function ensureClaudeDir(repoRoot: string): string[] {
     });
     return [];
   }
+}
+
+/**
+ * The `.claude/skills` entries that are NOT this composition — empty when the
+ * worktree resolves every skill through a link into SKILLS_ROOT or this repo.
+ *
+ * A session runs for hours inside the worktree, and the work repo COMMITS
+ * `.claude/`: one `git checkout -- .`, `git stash` or `reset --hard` lays the
+ * work repo's copies back down as real directories, and from then on every
+ * name the work repo ships resolves its older file. relink() backs off from a
+ * real directory, so ensureClaudeDir() alone cannot notice. The caller checks
+ * this before every attempt and, when it is non-empty, detaches the tracked
+ * `.claude` again and recomposes.
+ *
+ * A dangling link counts too (the harness enumerates the directory, and a
+ * broken entry errors), and so does a missing `skills/` — nothing is composed.
+ */
+export function assertComposed(repoRoot: string): string[] {
+  const skills = join(repoRoot, '.claude', 'skills');
+  if (!isDirectory(skills)) return ['.claude/skills'];
+  const ours = new Set([join(SKILLS_ROOT, 'skills'), join(ROOT, 'skills')]);
+  const foreign: string[] = [];
+  for (const name of readdirSync(skills)) {
+    if (name.startsWith('.')) continue;
+    const entry = join(skills, name);
+    let target = '';
+    try { target = isSymlink(entry) ? resolve(dirname(entry), readlinkSync(entry)) : ''; } catch { target = ''; }
+    if (!target || !ours.has(dirname(target)) || !existsSync(entry)) foreign.push(name);
+  }
+  return foreign;
 }

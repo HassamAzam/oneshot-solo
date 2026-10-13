@@ -3,18 +3,16 @@
  *
  * GitLab and the demo box both live behind FortiClient, and that tunnel drops.
  * Without a breaker, a dropped VPN is the most expensive thing this system can
- * do: every phase burns its full wall-clock timeout on calls that cannot
+ * do: a session burns its full wall-clock timeout on calls that cannot
  * succeed, and the subscription window goes with it.
  *
  * Three states, not two. ok -> degraded after 2 consecutive failures ->
  * recovering on the first success -> ok only after 2 consecutive successes.
- * `recovering` is what stops a 5-second blip from flapping the system and the
- * Slack channel.
+ * `recovering` is what stops a 5-second blip from flapping the system.
  */
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
 import { PAUSE_NETWORK, STATE } from './config.js';
-import { logEvent } from './db.js';
 import { log } from './log.js';
 import { ping } from './gitlab.js';
 
@@ -89,7 +87,7 @@ export async function probe(): Promise<ProbeOutcome> {
       degradedSince = Date.now();
       backoffIndex = 0;
       writePause();
-      logEvent('network_degraded', { status: res.status, error: res.error });
+      log.info('network_degraded', { status: res.status, error: res.error });
       log.error('GitLab unreachable — network breaker OPEN', { kind: res.kind });
     } else if (state !== 'ok') {
       state = 'degraded';
@@ -107,7 +105,7 @@ export async function probe(): Promise<ProbeOutcome> {
       state = 'ok';
       clearPause();
       const downtime = degradedSince ? Date.now() - degradedSince : 0;
-      logEvent('network_recovered', { downtimeMs: downtime });
+      log.info('network_recovered', { downtimeMs: downtime });
       log.ok(`GitLab reachable again after ${Math.round(downtime / 1000)}s`);
       degradedSince = 0;
     }

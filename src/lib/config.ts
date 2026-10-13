@@ -10,19 +10,17 @@
  * prompts about a detected key, it silently uses it, and a subscription fleet
  * becomes a metered API bill with no signal that anything changed.
  */
-import { readFileSync, existsSync, mkdirSync, symlinkSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir, userInfo } from 'node:os';
+import { homedir } from 'node:os';
 import { config as loadDotenv } from 'dotenv';
 import { deskUsername } from './identity.js';
 import {
-  LEGACY_SELECTOR_KEYS, REPO_URL_VAR, SKIP_REPO_CHECK_VAR, expandPath as expandPathFrom, isTargetName, readEnv,
-  repoCheckOverride, resolvePath, resolveTarget, scopedEnvName as scopedEnvNameFor, spellings,
+  LEGACY_SELECTOR_KEYS, REPO_URL_VAR, SKIP_REPO_CHECK_VAR, expandPath as expandPathFrom, readEnv,
+  repoCheckOverride, resolvePath, resolveTarget, scopedEnvName, spellings,
   type GitlabRepo, type ResolvedPath,
 } from './repourl.cjs';
-import { parseMrFeedbackConfig } from '../mrfeedback/config.js';
-import type { MrFeedbackConfig } from '../mrfeedback/types.js';
 
 export const ROOT: string = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -37,22 +35,6 @@ loadDotenv({ path: join(ROOT, '.env'), quiet: true });
  */
 export function envOr(name: string, fallback = ''): string {
   return readEnv(process.env, name, fallback);
-}
-
-/**
- * Whose desk this conductor is.
- *
- * Shown on the Slack card so several loops sharing one channel are tellable
- * apart, and written into the ticket's claim note so a person reading it can
- * see who to talk to. ONESHOT_OPERATOR is explicit; BOARD_OPERATOR is the same
- * fact the telemetry board already asks for, so a desk configured for the
- * board needs nothing more; the OS username is what both of those default to
- * on the board side too. Never the git author — that is deliberately the bot.
- */
-export function operatorName(): string {
-  const explicit = envOr('ONESHOT_OPERATOR') || envOr('BOARD_OPERATOR');
-  if (explicit) return explicit;
-  try { return userInfo().username; } catch { return 'oneshot'; }
 }
 
 export function envFlag(name: string): boolean {
@@ -71,254 +53,64 @@ export function expandPath(p: string): string {
 
 // --------------------------------------------------------------- config files
 
-function loadJson<T>(name: string): T {
-  const path = join(ROOT, 'config', name);
-  try {
-    return JSON.parse(readFileSync(path, 'utf8')) as T;
-  } catch (err) {
-    throw new Error(`Cannot read config/${name}: ${(err as Error).message}`);
-  }
-}
-
+/**
+ * config/project.json: everything about the project that GITLAB_REPO_URL does
+ * not say. The project itself is never read from here — that is gitlabRepo().
+ */
 export interface ProjectConfig {
-  /**
-   * The project, derived from GITLAB_REPO_URL — never read from project.json,
-   * which no longer names one. Reading it throws when the URL is unset or
-   * invalid; nothing else on this object does, so code that only wants labels
-   * or branches works on a machine that has not set the URL yet.
-   *
-   * There is no numeric id here on purpose. Every project endpoint accepts the
-   * URL-encoded path as `:id`, and the one caller that needs the number asks
-   * GitLab for it (src/lib/gitlab.ts, resolvedProjectId) rather than trusting a
-   * second copy of the project's identity to agree with the first.
-   */
-  gitlab: GitlabRepo;
-  contextRepo: { path: string; gitlabProject: string; skillsRoot: string };
-  labels: {
-    entry: string; entryId: number;
-    // Null while a label's id has not been verified against the live project.
-    // Nothing reads these ids — every check is by name — so an unverified
-    // label costs nothing except the reminder that it must already exist.
-    exit: string; exitId: number | null;
-    blocked: string; blockedId: number;
-    /**
-     * Optional, off-by-default. A ticket carrying this label ALONGSIDE `entry`
-     * gets three extra human sign-off pauses (plan, testcases, merge) — see
-     * src/conductor/reviewgate.ts and README's "Optional human review gates".
-     * Never required, never swapped by Oneshot, and absent entirely changes
-     * nothing: every check that reads it is an additive `labels.includes(...)`.
-     */
-    review: string;
-    /**
-     * Optional, off-by-default board marker — never required, never gates
-     * anything. Swapped onto the ticket the moment the testcases gate first
-     * posts its request comment, and off again the moment that gate is
-     * approved. See src/conductor/reviewgate.ts.
-     */
-    testcaseReview: string;
-    designReview: string;
-    /**
-     * Put on a ticket whose reported defect `research` could not reproduce on the
-     * base branch, in place of the entry label — only once a QA reviewer (config/
-     * reviewers.json) has confirmed the verdict by commenting `approved`. Must exist on the project; unset
-     * means the run still stops and says why, but no label is added.
-     */
-    notABug?: string;
-    /**
-     * Put on the ticket while its MR waits for a person to merge it, and taken
-     * off when the run finishes or blocks — so the board shows which tickets are
-     * waiting on a reviewer. Unset disables it.
-     */
-    inReview?: string;
-  };
-  /**
-   * Reproduce a reported bug on the base branch during `research` before any
-   * fix is planned (skill: bug-reproduction). A run whose defect does not
-   * reproduce parks for a QA reviewer; once they approve it stops, is labelled
-   * `labels.notABug`, and says so on the ticket
-   * and in Slack. False turns the whole step off.
-   *
-   * The project-wide half of the switch. The per-ticket half is the label
-   * mapped to `bug-reproduction` in the research phase's `labelSkills`: both
-   * must be true, so this being on does not mean every run reproduces.
-   */
-  bugReproduction?: boolean;
-  /**
-   * Apply the review gates to EVERY run, not only to tickets carrying `labels.review`
-   * or touching `highScrutinyPaths`. A change of posture rather than a tuning knob:
-   * with it on, every run pauses after `plan` and after `testcases`, and never merges
-   * its own MR. The label and the path list are still honoured and still matter — they
-   * are what keeps the consequential tickets gated if this is switched back off.
-   */
-  reviewAllRuns?: boolean;
-  /**
-   * Repo-relative path fragments whose modules are too consequential to ship
-   * unwatched. A run whose plan or diff touches one gets the `Review` label's
-   * gates whether or not anybody remembered to apply the label — see
-   * `highScrutinyHits()` in src/conductor/reviewgate.ts. Derived at load from the
-   * `paths` of every module in config/risk-modules.json, so emptying this array
-   * disables nothing — drop a module's `paths` there instead.
-   */
-  highScrutinyPaths: string[];
+  labels: { entry: string; exit: string; inReview: string; blocked: string };
   preserveLabels: string[];
-  branches: { base: string; protected: string[]; prefix: string; pattern: string };
-  /**
-   * The ERP delivery-zone map (src/conductor/zoneguard.ts). `file` is read from
-   * the work repo's origin/<base>; the guard applies only to tickets carrying
-   * `guardLabel`; `yellowLabel` (grooming's yellow classification, not a record
-   * that tests merged: see zoneVerdict) allows yellow areas; a ticket carrying
-   * `testsLabel` is always stopped (a person writes those). Absent = no zone guard,
-   * and no refusal either: that is how it ships until the map is on the base branch
-   * (see _comment_zones in config/project.json for the line that switches it on).
-   */
-  zones?: { file: string; guardLabel: string; yellowLabel: string; testsLabel?: string };
-  promotions: Array<{ from: string; to: string; auto: boolean }>;
-  /**
-   * The Ready For Automation mode (src/automation). Optional: absent, the mode
-   * cannot be switched on. Read through `automationConfig()`, which checks it,
-   * never directly. The Loop reads only its trigger label, through
-   * `automationTriggerLabel()`, to leave those tickets to the mode.
-   */
-  automation?: AutomationConfig;
-  concurrency: number;
+  branches: { base: string; protected: string[]; prefix: string };
+  merge: { mode: 'auto' | 'manual' };
+  bugReproduction: boolean;
+  hookPack?: string;
+  seed: { links: string[]; copies: string[] };
 }
 
-/**
- * config/project.json `automation`. The `_why` keys beside each field say what
- * it is for; this is the shape the code relies on.
- */
-export interface AutomationConfig {
-  /** Exact, case-sensitive GitLab label names. `deployed` is only read (by the readiness hook). */
-  labels: { trigger: string; deployed: string; review: string; done: string };
-  /** Regex SOURCE, e.g. '^Adhoc-\\d{4}-\\d{2}-\\d{2}$'. The hook compiles it with the 'i' flag. */
-  releaseBranchPattern: string;
-  sheet: { spreadsheetId: string; trackerTab: string; moduleTabPrefix: string; sectionAliases?: Record<string, string> };
-  /** A not-ready ticket is re-checked at least this often, since a merge does not touch the ticket. */
-  recheckMinutes: number;
-}
-
-/**
- * The turn cap a session phase gets when its config/phases.json row omits
- * `maxTurns`. One constant because two readers need the same number: phase.ts
- * hands it to the SDK, and a prompt that quotes its own budget must quote the
- * cap the SDK will actually enforce, not a different fallback typed beside it.
- */
-export const DEFAULT_MAX_TURNS = 40;
-
-export interface PhaseConfig {
-  name: string;
-  n: number;
-  kind: 'session' | 'code';
-  tier?: 'heavy' | 'standard' | 'light';
-  cwd?: 'worktree' | 'conductor';
-  maxTurns?: number;
-  timeoutMin: number;
-  writes?: string[];
-  onFail: 'skip' | 'warn' | 'abort' | 'retry' | 'cycle' | 'blocked';
-  maxRetries?: number;
-  cycleTo?: string;
-  maxLaps?: number;
-  coding?: boolean;
-  needsPort?: boolean;
-  /** Loaded for every ticket this phase runs on. */
-  skills?: string[];
-  /**
-   * Ticket label -> the skill that label calls for, loaded only when the
-   * ticket carries it.
-   *
-   * Data rather than a predicate in code, because that is all it is: a label
-   * is set by whoever triages and read here, with nothing to compute. Keeping
-   * it in the config is what makes the next one a single line — the skills a
-   * phase can load, and the labels that decide them, are then answerable
-   * without reading TypeScript.
-   */
-  labelSkills?: Record<string, string>;
-  /**
-   * A phase that runs ONLY when the ticket carries this label.
-   *
-   * Read case-insensitively, for the reason `labelSkills` already gives: a
-   * label is typed by hand, and `design` versus `Design` must not be the
-   * difference between a phase running and not when the failure is silent
-   * either way.
-   *
-   * Applied by FILTERING the phase out of the run's list, not by skipping it
-   * inside the loop. Not for an arithmetic reason: `cycleTo` resolves by name
-   * and a gated phase need not carry a group, so skipping one in place breaks
-   * nothing today. Filtering is the honest representation — the list a run
-   * walks is the list of phases that ran, and nobody reading a journal later
-   * has to work out which entries were inert.
-   *
-   * Not `onDemand`: that means "never scheduled, invoked out of band by the
-   * conductor when something needs it" (remediate, mr-feedback). This one is
-   * scheduled, in order, for the tickets it applies to.
-   */
-  labelGated?: string;
-  agents?: string[];
-  artifact?: string;
-  /**
-   * Concurrency marker. A maximal run of CONSECUTIVE phases sharing a group
-   * value is dispatched together, so a group is only ever as wide as the
-   * phases.json ordering allows — which is what keeps the config readable as a
-   * sequence and stops a stray group name from parallelising two phases that
-   * happen to be far apart.
-   */
-  group?: string;
-  /**
-   * A phase the executor never SCHEDULES. It still carries a position in the
-   * list, a model tier, a turn cap and a write scope like any other — it is
-   * simply invoked by name at the moment something needs it, and stepped over
-   * by the main loop.
-   *
-   * The position matters even though the loop skips it: `n` is what keeps the
-   * phase in the ordering the config reads as a sequence, and being in the list
-   * at all is what lets ONESHOT_SKIP_PHASES switch it off exactly like the rest.
-   */
-  onDemand?: boolean;
-  /**
-   * Restrict this phase to named targets — PROJECT_TARGET, the last path
-   * segment of GITLAB_REPO_URL.
-   *
-   * Absent — which is every phase that shipped before this field — means the
-   * phase runs for every target and for no target at all, so adding the field
-   * changes nothing about the pipeline anybody is already running.
-   *
-   * Present, the phase is dropped unless the active target is listed. That is
-   * what lets a change of pipeline SHAPE ride along with the project switch
-   * instead of landing on everyone the moment they pull: a phase nobody else
-   * asked for is a phase nobody else gets.
-   */
-  targets?: string[];
-}
-
-export interface BudgetConfig {
-  /** false disables every self-imposed token ceiling below. Absent means enabled. */
-  enabled?: boolean;
-  weights: { input: number; output: number; cache_creation: number; cache_read: number };
-  window_hours: number;
-  window_tokens: number;
-  day_tokens: number;
-  warn_pct: number;
-  reserve: {
-    pause_at_five_hour_pct: number;
-    pause_at_seven_day_pct: number;
-    signal_max_age_min: number;
+let projectCache: ProjectConfig | null = null;
+export function projectConfig(): ProjectConfig {
+  if (projectCache) return projectCache;
+  const raw = JSON.parse(readFileSync(join(ROOT, 'config', 'project.json'), 'utf8')) as Record<string, unknown>;
+  const labels = raw.labels as Record<string, string>;
+  for (const k of ['entry', 'exit', 'inReview', 'blocked']) {
+    if (!labels?.[k]) throw new Error(`config/project.json labels.${k} is required`);
+  }
+  const branches = raw.branches as Record<string, unknown>;
+  const merge = (raw.merge as { mode?: string } | undefined) ?? {};
+  const seed = (raw.seed as { links?: string[]; copies?: string[] } | undefined) ?? {};
+  projectCache = {
+    labels: { entry: labels.entry!, exit: labels.exit!, inReview: labels.inReview!, blocked: labels.blocked! },
+    preserveLabels: (raw.preserveLabels as string[] | undefined) ?? [],
+    branches: {
+      base: String(branches?.base ?? 'dev'),
+      protected: (branches?.protected as string[] | undefined) ?? ['dev', 'master', 'main'],
+      prefix: String(branches?.prefix ?? 'oneshot'),
+    },
+    merge: { mode: merge.mode === 'manual' ? 'manual' : 'auto' },
+    bugReproduction: raw.bugReproduction !== false,
+    hookPack: typeof raw.hookPack === 'string' && raw.hookPack ? raw.hookPack : undefined,
+    seed: { links: seed.links ?? [], copies: seed.copies ?? [] },
   };
-  ticket_tokens: number;
-  phases: Record<string, number>;
-  pause_defaults: { session_minutes: number; weekly_minutes: number };
+  return projectCache;
 }
 
-export interface SlackConfig {
-  channel: string;
-  card: { editInPlace: boolean; showTokens: boolean; showElapsed: boolean; showModel: boolean };
-  milestones: string[];
-  mentionOn: string[];
-  allowlist: string[];
-  verbs: Record<string, string>;
-  filler: string[];
-  maxTextLen: number;
-  maxCommandsPerActorPerHour: number;
-  requireMention: boolean;
+export interface RequiredLabel { name: string; why: string }
+
+/** Every label the conductor acts on by name, with what depends on it. Doctor checks each exists. */
+export function requiredLabels(cfg: ProjectConfig = projectConfig()): RequiredLabel[] {
+  return [
+    { name: cfg.labels.entry, why: 'the scan picks up tickets carrying it' },
+    { name: cfg.labels.exit, why: 'applied when the MR is merged' },
+    { name: cfg.labels.inReview, why: 'applied when the MR is open but not merged' },
+    { name: cfg.labels.blocked, why: 'applied when a run stops and needs a person' },
+  ];
+}
+
+/** project.json `merge.mode`, unless ONESHOT_MERGE says `auto` or `manual`. */
+export function mergeMode(): 'auto' | 'manual' {
+  const o = envOr('ONESHOT_MERGE', '').trim().toLowerCase();
+  if (o === 'auto' || o === 'manual') return o;
+  return projectConfig().merge.mode;
 }
 
 /**
@@ -328,7 +120,8 @@ export interface SlackConfig {
  * the project is first needed — loudly at boot and in doctor — rather than on
  * import, which tests and tooling do on machines that have not set it.
  */
-const TARGET = resolveTarget(process.env, ROOT);
+export type ResolvedTarget = ReturnType<typeof resolveTarget>;
+export const TARGET: ResolvedTarget = resolveTarget(process.env, ROOT);
 
 /**
  * The target name: the last path segment of GITLAB_REPO_URL, lower-cased —
@@ -340,18 +133,6 @@ const TARGET = resolveTarget(process.env, ROOT);
  * to set it and now only gets checked against it (repocheck.ts identityFindings).
  */
 export const PROJECT_TARGET: string = TARGET.name;
-
-/**
- * The per-machine, per-project spelling of a path variable:
- * `ONESHOT_<NAME>_<VAR>`, keyed by the target name.
- *
- * A leading `ONESHOT_` is stripped before scoping so `ONESHOT_SEED_FROM` scopes
- * to `ONESHOT_ERP_SEED_FROM` rather than `ONESHOT_ERP_ONESHOT_SEED_FROM`. Empty
- * when there is no target name, rather than a `ONESHOT__WORK_REPO` nobody meant.
- */
-export function scopedEnvName(envName: string): string {
-  return scopedEnvNameFor(PROJECT_TARGET, envName);
-}
 
 /**
  * The project GITLAB_REPO_URL names — the same read, at load, that every path
@@ -369,438 +150,84 @@ export function repoIdentity(): { repo: GitlabRepo | null; error: string | null 
   return { repo: TARGET.repo, error: TARGET.error };
 }
 
-let _project: ProjectConfig | null = null;
-export function projectConfig(): ProjectConfig {
-  if (!_project) {
-    const c = loadJson<Omit<ProjectConfig, 'gitlab'>>('project.json') as ProjectConfig;
-    // A getter rather than a value, so that a machine without GITLAB_REPO_URL
-    // can still read labels and branches: only asking WHICH project throws.
-    Object.defineProperty(c, 'gitlab', { get: gitlabRepo, enumerable: false, configurable: true });
-    // Review gating only. The Plane triage router used to read this file too; it
-    // now routes by the ERP repo's own .claude/zones.json (see _comment_high_scrutiny).
-    const risk = loadJson<{ modules: Array<{ paths?: string[] }> }>('risk-modules.json');
-    c.highScrutinyPaths = [...new Set([...(c.highScrutinyPaths ?? []), ...risk.modules.flatMap((m) => m.paths ?? [])])];
-    _project = c;
-  }
-  return _project;
+// ------------------------------------------------------------------ session
+
+/** The model the ticket session runs on. */
+export function sessionModel(): string { return envOr('ONESHOT_MODEL', 'claude-opus-5-5'); }
+
+/** The session's turn cap, wall-clock timeout and idle watchdog; 0 is a value, not unset. */
+export function sessionCaps(): { maxTurns: number; timeoutMin: number; idleMin: number } {
+  const n = (name: string, d: number): number => { const v = Number(envOr(name, '')); return Number.isFinite(v) && envOr(name, '') !== '' ? v : d; };
+  return { maxTurns: n('ONESHOT_MAX_TURNS', 600), timeoutMin: n('ONESHOT_TIMEOUT_MIN', 240), idleMin: n('ONESHOT_IDLE_MIN', 15) };
 }
 
-/** True unless config/project.json switches bug reproduction off. */
-export function bugReproductionEnabled(): boolean {
-  return projectConfig().bugReproduction !== false;
-}
+/** The one port the ticket's app runs on; there is no pool. */
+export function appPort(): number { return Number(envOr('ONESHOT_PORT', '8000')) || 8000; }
 
 /**
- * Whether `phase` belongs to `target`. Compared the way PROJECT_TARGET is
- * derived — trimmed and lower-cased — so `ERP` in phases.json is the erp
- * target rather than a phase that silently never runs.
+ * The superpowers plugin directory the session loads: ONESHOT_SUPERPOWERS_PATH,
+ * else the installPath Claude Code recorded in ~/.claude/plugins/installed_plugins.json,
+ * else null (boot refuses). `home` is a parameter only so a test can point it elsewhere.
  */
-export function runsForTarget(phase: Pick<PhaseConfig, 'targets'>, target: string): boolean {
-  return !phase.targets || phase.targets.some((t) => t.trim().toLowerCase() === target);
-}
-
-/**
- * Refuses a `targets` list that no project's GITLAB_REPO_URL could ever select:
- * not an array, or an entry that, trimmed and lower-cased as runsForTarget
- * compares it, is not a name resolveTarget can derive for a project. The test
- * is repourl.cjs isTargetName, the URL parser's own rule rather than a copy of
- * it. It fails an entry that is blank or carries a slash or whitespace, which a
- * project's last path segment never does; one the parser refuses as a path
- * segment (`.erp`, `erp.`, `erp?`); and one ending in the `.git` it strips from
- * a clone URL (`erp.git`). Any of those would drop its phase on every project
- * without a word. There is no list of known projects to check a spelling
- * against, so a well-formed typo still drops the phase; doctor names every
- * phase the active target leaves out so that is visible.
- */
-export function assertTargets(phase: Pick<PhaseConfig, 'name' | 'targets'>): void {
-  if (phase.targets === undefined) return;
-  const where = `config/phases.json: phase '${phase.name}'`;
-  if (!Array.isArray(phase.targets)) throw new Error(`${where}: \`targets\` must be an array of project names`);
-  const bad = phase.targets.filter((t) => typeof t !== 'string' || !isTargetName(t.trim().toLowerCase()));
-  if (bad.length) {
-    throw new Error(`${where} names target(s) no project can match: ${bad.map((t) => JSON.stringify(t)).join(', ')}. `
-      + 'A target is the last path segment of GITLAB_REPO_URL, like `erp`.');
-  }
-}
-
-/** Configured phases the active target leaves out, with the targets each one names. */
-export function phasesOutsideTarget(): Array<{ name: string; targets: string[] }> {
-  return loadJson<{ phases: PhaseConfig[] }>('phases.json').phases
-    .filter((p) => !runsForTarget(p, PROJECT_TARGET))
-    .map((p) => ({ name: p.name, targets: p.targets ?? [] }));
-}
-
-let _phases: PhaseConfig[] | null = null;
-export function phases(): PhaseConfig[] {
-  if (!_phases) {
-    const skip = new Set(
-      envOr('ONESHOT_SKIP_PHASES').split(',').map((s) => s.trim()).filter(Boolean),
-    );
-    const all = loadJson<{ phases: PhaseConfig[] }>('phases.json').phases;
-    all.forEach(assertTargets);
-    _phases = all
-      .filter((p) => !skip.has(p.name))
-      // A phase that names targets belongs to those targets only. An empty
-      // array is read the same as naming none of them: the phase never runs,
-      // which is a switched-off phase rather than an unrestricted one.
-      .filter((p) => runsForTarget(p, PROJECT_TARGET))
-      .sort((a, b) => a.n - b.n);
-  }
-  return _phases;
-}
-
-export function phaseByName(name: string): PhaseConfig | undefined {
-  return phases().find((p) => p.name === name);
-}
-
-export interface RequiredLabel { name: string; why: string }
-
-/**
- * Every label this harness acts on by name, with what depends on it.
- *
- * Pure and fully parameterised so the SELECTION can be tested: checking the
- * result against a live project only proves the labels it happened to list
- * exist, never that the right ones were collected. An optional label that is
- * unset is not required — an empty string is "this gate is off", not a label
- * called "". `notABug` is required only while reproduction is on, for the same
- * reason.
- */
-export function requiredLabels(
-  labels: ProjectConfig['labels'],
-  phaseList: Pick<PhaseConfig, 'name' | 'labelSkills' | 'labelGated'>[],
-  bugReproduction: boolean,
-): RequiredLabel[] {
-  const out = new Map<string, string>();
-  const need = (name: string | undefined, why: string): void => {
-    if (name && !out.has(name)) out.set(name, why);
-  };
-  need(labels.entry, 'entry — nothing is picked up without it');
-  need(labels.exit, 'exit — set when the run merges');
-  need(labels.blocked, 'blocked — set when a run stops for a human');
-  need(labels.review, 'review gate');
-  need(labels.testcaseReview, 'testcase QA gate');
-  need(labels.designReview, 'design gate');
-  need(labels.inReview, 'in-review marker');
-  if (bugReproduction) need(labels.notABug, 'bug reproduction verdict');
-  for (const ph of phaseList) {
-    // Before the routing loop, so a label doing both jobs reports under the
-    // worse consequence: a missing routing key loses a skill, a missing gate
-    // label loses the phase and the human sign-off that goes with it.
-    need(ph.labelGated, `gates the '${ph.name}' phase — without it the phase never runs, and nothing says so`);
-    for (const [label, skill] of Object.entries(ph.labelSkills ?? {})) {
-      need(label, `routes '${skill}' to ${ph.name}`);
-    }
-  }
-  return [...out].map(([name, why]) => ({ name, why }));
-}
-
-let _budgets: BudgetConfig | null = null;
-export function budgetConfig(): BudgetConfig {
-  if (!_budgets) {
-    const c = loadJson<BudgetConfig>('budgets.json');
-    const w = envOr('ONESHOT_WINDOW_TOKENS');
-    const d = envOr('ONESHOT_DAY_TOKENS');
-    const r = envOr('ONESHOT_RESERVE_PCT');
-    if (w) c.window_tokens = Number(w);
-    if (d) c.day_tokens = Number(d);
-    if (r) c.reserve.pause_at_five_hour_pct = Number(r);
-    _budgets = c;
-  }
-  return _budgets;
-}
-
-let _slack: SlackConfig | null = null;
-export function slackConfig(): SlackConfig {
-  if (!_slack) {
-    const c = loadJson<SlackConfig>('slack.json');
-    c.channel = envOr('ONESHOT_CHANNEL', c.channel);
-    _slack = c;
-  }
-  return _slack;
-}
-
-/**
- * The sign-off groups, by GitLab username (config/reviewers.json).
- *
- * Not merged into `slackConfig().allowlist`, which it replaces as the review
- * gates' authorisation source: that list holds SLACK user ids, and the gates
- * now read their verdict from GitLab ticket comments, where the only identity
- * on a note is a GitLab username. Keeping one list for both would mean an id
- * from one system silently failing to match a name from the other — the
- * failure mode being a gate that waits forever, which is indistinguishable
- * from a reviewer who has not looked yet.
- *
- * Unknown roles resolve to an empty list rather than throwing: `checkApprovalGate`
- * already treats empty as `unavailable` and blocks the run, which surfaces the
- * mistake to the person who can fix it instead of killing the conductor.
- */
-export interface ReviewersConfig {
-  dev: string[];
-  qa: string[];
-  /**
-   * The design gate's group. Deliberately neither `dev` nor derived from it:
-   * it holds a product owner who signs off designs but not plans, and a list
-   * inherited from `dev` would change whenever the plan approvers do.
-   */
-  design: string[];
-  /**
-   * The work-email domain a GitLab username is completed with to find that
-   * person's SLACK id (`<username>@<emailDomain>` → `users.lookupByEmail` →
-   * `<@U…>`), so a gate's approval request can @mention the people it is
-   * waiting on. See `mentionsFor` in src/conductor/reviewgate.ts.
-   *
-   * Derived rather than stored as a second list of ids on purpose: a mapping
-   * table is a third place a roster can drift out of date, and it drifts
-   * silently — the failure is a reviewer who stops being mentioned, which
-   * looks exactly like a reviewer who has not replied yet. The cost of
-   * deriving is that it assumes the convention holds; where it does not, that
-   * one person resolves to nothing and `doctor` names them.
-   *
-   * Empty switches mentioning off without switching notification off: the
-   * request still posts to the channel, unaddressed.
-   */
-  emailDomain: string;
-  /**
-   * GitLab username → pinned Slack member id, checked BEFORE any lookup.
-   *
-   * A gate's ask is posted exactly once, at the moment it arms. If the lookup
-   * behind that one message is rate-limited the ask goes out unaddressed and
-   * the reviewer never learns they are being waited on — so the mention that
-   * matters most is the one least able to tolerate a network dependency. A
-   * pinned id has none.
-   *
-   * Anyone absent here still resolves by handle, then by email, so adding a
-   * reviewer needs no id — it just makes their first mention depend on
-   * `users.list` answering. `doctor` cross-checks every pinned id against the
-   * live workspace, because a WRONG id mentions the wrong person, which is
-   * worse than mentioning nobody.
-   */
-  slackIds: Record<string, string>;
-}
-
-let _reviewers: ReviewersConfig | null = null;
-export function reviewersConfig(): ReviewersConfig {
-  if (!_reviewers) {
-    const c = loadJson<Partial<ReviewersConfig>>('reviewers.json');
-    _reviewers = {
-      dev: Array.isArray(c.dev) ? c.dev : [],
-      qa: Array.isArray(c.qa) ? c.qa : [],
-      design: Array.isArray(c.design) ? c.design : [],
-      emailDomain: envOr('ONESHOT_REVIEWER_EMAIL_DOMAIN', typeof c.emailDomain === 'string' ? c.emailDomain : ''),
-      slackIds: (c.slackIds && typeof c.slackIds === 'object') ? c.slackIds : {},
-    };
-  }
-  return _reviewers;
-}
-
-/**
- * config/project.json `automation`, checked. Throws
- * 'config/project.json has no usable `automation` block: <what>' naming the
- * first field that is missing or of the wrong type.
- *
- * Checked field by field rather than cast, because every one of these is used
- * somewhere a wrong value is silent: an empty label name makes the scan find
- * nothing, a bad regex makes the readiness check hold every ticket as
- * `unknown`, and a non-numeric cadence makes a not-ready ticket re-check every
- * tick. Saying which field is wrong at boot is cheaper than any of those. Not cached, so a test or
- * a preflight always sees the file as it is. `cfg` is for tests; everything
- * else reads config/project.json.
- */
-export function automationConfig(cfg: Pick<ProjectConfig, 'automation'> = projectConfig()): AutomationConfig {
-  const bad = (what: string): never => {
-    throw new Error(`config/project.json has no usable \`automation\` block: ${what}`);
-  };
-  const a = cfg.automation as unknown;
-  if (!a || typeof a !== 'object') bad('it is missing');
-  const raw = a as Record<string, unknown>;
-  const str = (v: unknown, name: string): string => (typeof v === 'string' && v.trim() !== '' ? v : bad(`${name} must be a non-empty string`));
-
-  const labels = (raw.labels ?? {}) as Record<string, unknown>;
-  const sheet = (raw.sheet ?? {}) as Record<string, unknown>;
-  const releaseBranchPattern = str(raw.releaseBranchPattern, 'releaseBranchPattern');
-  try { new RegExp(releaseBranchPattern, 'i'); } catch { bad('releaseBranchPattern is not a valid regular expression'); }
-  const recheckMinutes = raw.recheckMinutes;
-  if (typeof recheckMinutes !== 'number' || !Number.isFinite(recheckMinutes) || recheckMinutes <= 0) {
-    bad('recheckMinutes must be a positive number');
-  }
-  const aliases = sheet.sectionAliases;
-  if (aliases !== undefined && (typeof aliases !== 'object' || aliases === null || Array.isArray(aliases)
-    || Object.values(aliases).some((v) => typeof v !== 'string'))) {
-    bad('sheet.sectionAliases must map module names to strings');
-  }
-  return {
-    labels: {
-      trigger: str(labels.trigger, 'labels.trigger'),
-      deployed: str(labels.deployed, 'labels.deployed'),
-      review: str(labels.review, 'labels.review'),
-      done: str(labels.done, 'labels.done'),
-    },
-    releaseBranchPattern,
-    sheet: {
-      spreadsheetId: str(sheet.spreadsheetId, 'sheet.spreadsheetId'),
-      trackerTab: str(sheet.trackerTab, 'sheet.trackerTab'),
-      moduleTabPrefix: str(sheet.moduleTabPrefix, 'sheet.moduleTabPrefix'),
-      ...(aliases ? { sectionAliases: aliases as Record<string, string> } : {}),
-    },
-    recheckMinutes: recheckMinutes as number,
-  };
-}
-
-/**
- * The Ready For Automation trigger label, for the LOOP's routing: a ticket
- * carrying it beside the entry label belongs to the automation mode, and the
- * Loop pipeline never works it (src/conductor/watcher.ts, automationOwns).
- *
- * The routing holds on every desk, the mode switched on here or not. Null when
- * the block is not usable — whenever automationConfig() would throw (missing,
- * or any field wrong, the sheet's included): the mode cannot run anywhere
- * then, so there is no trigger to route on and the Loop behaves as it did
- * before the mode existed, rather than leaving the ticket to nobody. Never
- * throws: the Loop's scan and runTicket call it.
- */
-export function automationTriggerLabel(cfg?: Pick<ProjectConfig, 'automation'>): string | null {
+export function superpowersPath(home: string = homedir()): string | null {
+  const fromEnv = envOr('ONESHOT_SUPERPOWERS_PATH', '').trim();
+  if (fromEnv) return expandPath(fromEnv);
+  const registry = join(home, '.claude', 'plugins', 'installed_plugins.json');
+  if (!existsSync(registry)) return null;
   try {
-    return automationConfig(cfg ?? projectConfig()).labels.trigger;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * `.env` ONESHOT_AUTOMATION=1 turns the Ready For Automation tick on for THIS
- * desk. Off by default, and meant for one desk only: the per-ticket lock is a
- * local file, so two desks on the same ticket would each spend a session.
- * `--automation <iid>` works without it.
- */
-export function automationEnabled(): boolean {
-  return envFlag('ONESHOT_AUTOMATION');
-}
-
-/**
- * The Google service-account key the sheet writer signs with. Read by
- * conductor code only: it is not in BASE_ENV, so it reaches no session, and
- * the automation session is denied every file-reading tool besides.
- */
-export function googleServiceAccountFile(): string {
-  return expandPath(envOr('ONESHOT_GOOGLE_SA_FILE', '~/.claude/google-service-account.json'));
-}
-
-let _mrFeedback: MrFeedbackConfig | null = null;
-/** config/mr-feedback.json, validated. A missing file is the feature switched off. */
-export function mrFeedbackConfig(): MrFeedbackConfig {
-  if (!_mrFeedback) {
-    const present = existsSync(join(ROOT, 'config', 'mr-feedback.json'));
-    _mrFeedback = parseMrFeedbackConfig(present ? loadJson<unknown>('mr-feedback.json') : {}, reviewersConfig());
-  }
-  return _mrFeedback;
-}
-
-export function modelFor(phase: PhaseConfig): string {
-  const m = loadJson<{
-    tiers: Record<string, string>;
-    narrator: string;
-    overrides: Record<string, string>;
-  }>('models.json');
-  const tier = m.overrides[phase.name] ?? phase.tier ?? 'standard';
-  const model = m.tiers[tier];
-  if (!model) throw new Error(`config/models.json has no tier '${tier}' (phase ${phase.name})`);
-  return model;
-}
-
-export function narratorModel(): string {
-  const m = loadJson<{ tiers: Record<string, string>; narrator: string }>('models.json');
-  return m.tiers[m.narrator] ?? m.tiers.light ?? 'claude-haiku-4-5-20251001';
+    const reg = JSON.parse(readFileSync(registry, 'utf8')) as { plugins?: Record<string, Array<{ installPath?: string }>> };
+    for (const [key, entries] of Object.entries(reg.plugins ?? {})) {
+      if (!key.startsWith('superpowers@')) continue;
+      const p = entries.find((e) => e.installPath)?.installPath;
+      if (p) return p;
+    }
+  } catch { /* unreadable registry → null */ }
+  return null;
 }
 
 // ------------------------------------------------------------------ paths
 
 export const DRY_RUN = envFlag('DRY_RUN');
+
 /**
  * The GitLab username this desk claims ASSIGNED tickets as.
  *
  * Not configuration. It is whoever this desk's GitLab token belongs to, resolved
- * once at boot by asking GitLab (src/lib/identity.ts), so the account that claims
- * a ticket is always the account that will comment, push and merge on it.
- *
- * Use gitlabUsername() rather than the const: the const is captured at module
- * load, which is before boot has asked.
+ * by asking GitLab — at boot, or by a later tick when GitLab did not answer then
+ * (src/lib/identity.ts) — so the account that claims a ticket is always the
+ * account that will comment, push and merge on it. A function rather than a
+ * const because a const would be captured at module load, which is before boot
+ * has asked.
  */
-export const GITLAB_USERNAME = deskUsername();
 export function gitlabUsername(): string { return deskUsername(); }
 
-/**
- * The conductor's own tick cadence — how often `src/index.ts` scans for
- * claimable tickets. Exported so anything that needs to describe its own
- * cadence as "the same as the tick loop" (e.g. the review-gate park state in
- * src/conductor/reviewgate.ts, which relies on being re-checked on the next
- * scan rather than running its own timer) points at the one number instead of
- * repeating it.
- */
+/** The conductor's tick cadence — how often `src/index.ts` scans for claimable tickets. */
 export const TICK_MS = 60_000;
 
 /**
- * How often `--follow` re-checks a single ticket while it sits parked at a
- * Review gate, waiting for `approved` or feedback in the Slack thread.
- *
- * Deliberately slower than TICK_MS. A parked run re-enters the pipeline on
- * every tick, and any phase that has NOT recorded a success is re-attempted
- * from scratch each time — a `skip`-on-fail phase like `recall` re-runs a full
- * model lap per tick, which at 60s costs a lap a minute for as long as a human
- * takes to reply. Three minutes keeps a reply picked up promptly while cutting
- * that waste threefold. It never stops on its own: only `approved` or feedback
- * moves the run on.
+ * Where the guard hooks find this checkout: hooks/_common.cjs derives state/,
+ * config/ and .env from `$ONESHOT_HOME`. Always ROOT — a dry run shares it.
  */
-export const FOLLOW_TICK_MS = 180_000;
+export const ONESHOT_HOME: string = ROOT;
 
 /**
- * How often the `merge` phase re-asks whether a human has merged a
- * Review-labelled ticket's MR. Merging and deploying such a ticket is a
- * person's decision end to end — Oneshot opens the MR and then only watches —
- * so this is a slow, patient poll rather than the tick loop's cadence.
- */
-export const MERGE_POLL_MS = 1_800_000;
-
-/**
- * A dry run's own home, so DRY_RUN=1 cannot disturb the conductors doing real
- * work.
+ * Where runs, pause files and the pid file live: ONESHOT_STATE_DIR, else
+ * ONESHOT_HOME/state. Everything below derives from it, once, at load.
  *
- * Sharing state/ was the flaw: a dry run's rows sat in the same claim table and
- * the same port pool as everybody else's, so it hid tickets from the watcher and
- * held ports nothing was listening on, and its journals were what a resumed real
- * run read back. "Changes nothing" has to mean changes nothing HERE too, not
- * just nothing on GitLab.
- *
- * It is a whole shadow home rather than a bare directory because the guard hooks
- * have to agree. hooks/_common.cjs derives everything it reads from
- * `$ONESHOT_HOME` — state/ for the journals and the pause switches, config/ for
- * the branch policy, .env for the token — and deploy-guard refuses outright when
- * it cannot read the run journal. So state-dry/ carries its own state/ and
- * borrows the other two by symlink, and ONESHOT_HOME points at it: the hooks
- * then resolve the same configuration the conductor loaded and the same journals
- * the dry run is writing.
+ * The override exists so a test can point every derived path at a temp dir
+ * (src/lib/test-scratch-home.ts) instead of this checkout's live state/. The
+ * guard hooks do not read it — hooks/_common.cjs derives state/ from
+ * ONESHOT_HOME — so it is not an operator setting for a live conductor.
  */
-function dryHome(): string {
-  const home = join(ROOT, 'state-dry');
-  mkdirSync(join(home, 'state'), { recursive: true });
-  for (const shared of ['config', '.env']) {
-    const link = join(home, shared);
-    if (existsSync(link) || !existsSync(join(ROOT, shared))) continue;
-    try {
-      symlinkSync(join(ROOT, shared), link);
-    } catch { /* another dry conductor got there first */ }
-  }
-  return home;
-}
-
-export const ONESHOT_HOME: string = DRY_RUN ? dryHome() : ROOT;
-
-export const STATE = join(ONESHOT_HOME, 'state');
+export const STATE = expandPath(envOr('ONESHOT_STATE_DIR', '')) || join(ONESHOT_HOME, 'state');
 export const RUNS = join(STATE, 'runs');
-export const MEMORY = join(STATE, 'memory');
+/** Where a finished run's whole directory goes when its ticket is run again. */
+export const RUNS_ARCHIVE = join(STATE, 'runs-archive');
 export const PAUSE = join(STATE, 'PAUSE');
 export const PAUSE_QUOTA = join(STATE, 'PAUSE-QUOTA');
 export const PAUSE_NETWORK = join(STATE, 'PAUSE-NETWORK');
-export const DB_PATH = join(STATE, 'oneshot.db');
+/** Holds the running conductor's pid, so a second one refuses to start. */
+export const PID_FILE = join(STATE, 'conductor.pid');
 
 /**
  * The clone of GITLAB_REPO_URL that per-ticket worktrees are cut from:
@@ -838,14 +265,33 @@ function seedPath(): ResolvedPath {
 }
 
 /**
- * The installed clone a leased worktree borrows node_modules, venv and
- * staticfiles from. Empty means seeding is switched off, which costs `npm ci`
- * minutes per worktree — so it stays a function with no default rather than
- * quietly becoming WORK_REPO.
+ * ONESHOT_SEED_FROM as set: the installed clone a leased worktree borrows
+ * node_modules, venv and staticfiles from. '' when unset — and unset means
+ * WORK_REPO is the seed source: every consumer reads `seedFrom() || WORK_REPO`
+ * (seedWorktree, projectSessionEnv, and app.cjs's own fallback), because the
+ * work repo is itself an installed clone. This returns the raw setting only so
+ * doctor and boot can say which variable supplied the path.
+ *
+ * To seed nothing, empty the lists rather than the source: `seed.links` and
+ * `seed.copies` in config/project.json. A blank ONESHOT_SEED_LINKS= reads as
+ * unset (repourl.cjs readEnv) and falls back to those lists.
  */
 export function seedFrom(): string {
   return seedPath().path;
 }
+
+function csv(name: string, fallback: string[]): string[] {
+  const v = envOr(name, '').trim();
+  return v ? v.split(',').map((s) => s.trim()).filter(Boolean) : fallback;
+}
+
+/**
+ * What a worktree symlinks and copies from the seed: ONESHOT_SEED_LINKS /
+ * ONESHOT_SEED_COPIES, else project.json `seed`. The one place the defaults
+ * live — the session gets the resolved lists through projectSessionEnv().
+ */
+export function seedLinks(): string[] { return csv('ONESHOT_SEED_LINKS', projectConfig().seed.links); }
+export function seedCopies(): string[] { return csv('ONESHOT_SEED_COPIES', projectConfig().seed.copies); }
 
 /**
  * Which variable supplied each project path — the scoped ONESHOT_<NAME>_<VAR>,
@@ -858,7 +304,7 @@ export function pathSources(): Record<'WORK_REPO' | 'WT_ROOT' | 'ONESHOT_SEED_FR
 
 /**
  * The project, and the paths the conductor resolved for it, as a session's
- * environment — merged over BASE_ENV by the phase runner.
+ * environment — merged over BASE_ENV by the session runner.
  *
  * A session's environment is an allowlist, and scripts/app.cjs inside one has
  * no conductor to inherit from: it loads ONESHOT_HOME/.env and resolves the
@@ -872,9 +318,9 @@ export function pathSources(): Record<'WORK_REPO' | 'WT_ROOT' | 'ONESHOT_SEED_FR
  * Every other spelling that could outrank them — the scoped
  * ONESHOT_<NAME>_<VAR>, the ONELOOP_ forms, the legacy selectors the conductor
  * has already judged — is set to '' rather than left out: dotenv only fills a
- * key that is ABSENT, and repourl.cjs reads '' as unset. The seed is passed as
- * the conductor resolved it; '' (seeding off here) is what makes app.cjs fall
- * back to WORK_REPO, as it always has.
+ * key that is ABSENT, and repourl.cjs reads '' as unset. The seed is the one
+ * app.cjs would resolve itself — the conductor's, else WORK_REPO — and the seed
+ * lists are the resolved seedLinks()/seedCopies(), so app.cjs reads env only.
  *
  * ONESHOT_SKIP_REPO_CHECK is handed over the same way: '1' when the conductor
  * booted with it on, '' otherwise, both spellings. Exported only in the shell
@@ -889,11 +335,13 @@ export function projectSessionEnv(): Record<string, string> {
     [REPO_URL_VAR]: repo.url,
     WORK_REPO,
     WT_ROOT,
-    ONESHOT_SEED_FROM: seedFrom(),
+    ONESHOT_SEED_FROM: seedFrom() || WORK_REPO,
     ONELOOP_SEED_FROM: '',
+    ONESHOT_SEED_LINKS: seedLinks().join(','),
+    ONESHOT_SEED_COPIES: seedCopies().join(','),
   };
   for (const v of ['WORK_REPO', 'WT_ROOT', 'ONESHOT_SEED_FROM']) {
-    const scoped = scopedEnvName(v);
+    const scoped = scopedEnvName(PROJECT_TARGET, v);
     if (scoped) for (const k of spellings(scoped)) env[k] = '';
   }
   for (const k of LEGACY_SELECTOR_KEYS) env[k] = '';
@@ -904,11 +352,7 @@ export function projectSessionEnv(): Record<string, string> {
 
 export function runDir(iid: number): string { return join(RUNS, String(iid)); }
 export function artifactDir(iid: number): string { return join(runDir(iid), 'artifacts'); }
-
-export function portPool(): number[] {
-  return envOr('PORT_POOL', '8000,8001,8002')
-    .split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0);
-}
+export function transcriptDir(iid: number): string { return join(runDir(iid), 'transcripts'); }
 
 // -------------------------------------------------------------- session env
 
@@ -1004,16 +448,9 @@ function buildBaseEnv(): Record<string, string> {
 }
 
 /**
- * The auth-and-identity half of the session environment.
- *
- * Telemetry is deliberately NOT merged here. otel.ts imports this module, so
- * calling into it during BASE_ENV's module-init would be an import cycle
- * evaluated at exactly the wrong moment. The phase runner composes the full
- * environment instead:
- *
- *   { ...BASE_ENV, ...otelBaseEnv(), ...otelSpawnEnv(identity), ...phaseVars }
- *
- * which also keeps this constant about one thing: keeping metered-billing
+ * The auth-and-identity half of the session environment. The session runner
+ * composes the rest over it — `{ ...BASE_ENV, ...projectSessionEnv(), ...identity }` —
+ * which keeps this constant about one thing: keeping metered-billing
  * credentials out of sessions.
  */
 export const BASE_ENV: Record<string, string> = buildBaseEnv();
@@ -1031,9 +468,9 @@ export interface AuthReport {
  * Report which credential a session will actually use.
  *
  * Reports variable NAMES only, never values. `apiKeyHelper` is a NOTE rather
- * than a problem: phase sessions load `settingSources: ['project']` only
- * (src/conductor/phase.ts), so a helper configured at user level never runs for
- * one. It is still worth saying, because it does run for the operator's own
+ * than a problem: the ticket session loads `settingSources: ['project']` only
+ * (src/ticket/session.ts), so a helper configured at user level never runs for
+ * it. It is still worth saying, because it does run for the operator's own
  * interactive sessions on the same machine — the thing this audit is really
  * about is nobody discovering a metered bill by accident.
  */

@@ -1,9 +1,9 @@
 /**
- * Reading back what a phase session actually did, from the transcript it left.
+ * Reading back what a session actually did, from the transcript it left.
  *
- * A phase writes two things: the artifact its schema describes, and the raw
- * session transcript beside it (`transcriptPath` in artifacts.ts). The artifact
- * is what the pipeline consumes. The transcript is the only record of what the
+ * A session leaves two things: the structured result its schema describes, and
+ * the raw transcript tee (`transcriptPath` in journal.ts). The result is what
+ * the conductor consumes. The transcript is the only record of what the
  * run COST to produce — turns, dollars, and which skills the session chose to
  * launch as opposed to which ones it was handed.
  *
@@ -12,16 +12,14 @@
  * have disagreed often enough that the difference is worth reading rather than
  * assuming.
  */
-import { readFileSync } from 'node:fs';
-
 /**
  * A phase transcript's own result frame: the structured output, turns and cost.
  *
  * The FIRST result frame, not the last — a session can emit several. Observed
  * live: a `success` frame carrying the real turn count and usage, followed by
- * an `error_during_execution` frame carrying zero of both. src/conductor/
- * phase.ts settles a live phase on the first frame for that reason and leaves
- * the rest in the tee; a reader that takes the last one disagrees with the
+ * an `error_during_execution` frame carrying zero of both. The conductor
+ * settles a live attempt on the first frame for that reason and leaves the
+ * rest in the tee (telemetry.ts sessionStats reads it the same way); a reader that takes the last one disagrees with the
  * conductor about what the same session did, and records a plan that cost real
  * money as free. Assistant frames are skipped by type, not by position, so
  * scanning forward costs nothing.

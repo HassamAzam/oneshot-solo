@@ -1,86 +1,13 @@
 {
-  "_comment": "Which labels, branches and gates Oneshot uses on its GitLab project. The project itself is NOT named here: GITLAB_REPO_URL in .env is the single source of truth for which project (host, path and API are derived from it), and the numeric project id is asked of GitLab when something needs it, never configured. Everything below must hold on whichever project that URL names \u2014 the labels must exist there and the branches must be protected there. `npm run doctor` checks only the branches against the live project; nothing checks the labels, so confirm them by hand on the project (see _comment_labels).",
-  "_comment_context": "Read-only. Oneshot reads this repo for prior art and conventions; it NEVER writes to it, and hooks/write-scope.js denies every write under contextRepo for every phase. See docs/HOOKS.md 4.1. Skills/agents/rules are no longer sourced live from here: they are vendored into this repo's context/ (a committed snapshot of erp/.claude that also stays in GitLab), and SKILLS_ROOT (ONESHOT_SKILLS_ROOT) defaults to that vendored copy. skillsRoot below is informational only \u2014 nothing reads it \u2014 and records where the upstream skills live for a human syncing the snapshot.",
-  "contextRepo": {
-    "path": "~/Documents/erp",
-    "gitlabProject": "arbisoft/erp",
-    "skillsRoot": "~/Documents/erp/.claude"
-  },
-  "_comment_labels": "ONE label in, one label out. The exit label is 'Merged': the pipeline ends at the merge, so 'Ready For Deployment' would be a claim about a deploy nobody performed. Every label check is by NAME and is case-sensitive, so each name must match the project's label exactly and must already EXIST there: Oneshot never creates, renames or deletes a label, and a swap naming a label that is not there silently drops it. The ids are informational \u2014 nothing reads them. Verified on 2026-09-22 against the ERP project, which is the one GITLAB_REPO_URL names as this is written: 'Merged' (707) and 'In Review' (563) already existed there, and 'Loop' (1336) and 'Needs Human' (1337) were created that day, so the required pair is present. Pointing GITLAB_REPO_URL at another project means checking these names exist on it. There is no intermediate state machine \u2014 progress lives in the Slack card and the run journal, not on the board. 'review', 'testcaseReview', 'designReview' and 'notABug' are OPTIONAL; empty is the documented way to switch an optional LABEL off, and setting one to an existing label name switches it on. 'testcaseReview' is ON, naming 'TestCase Review' (1342), which was created on the project AFTER the move here \u2014 it was emptied on 2026-09-24 because ERP had no such label then, and that is no longer true. The others stay empty: 'Design Review' does not exist on the project, and 'Review' does exist but is deliberately left off because it is not board-only \u2014 it adds three human sign-off pauses. Empty switches off only the label, never the behaviour around it: an empty 'notABug' still lets bug reproduction stop a run (bugReproduction:false is what switches that off), it just adds no label when it does. 'review', when set, is never required and never swapped by Oneshot: a ticket carrying it alongside 'Loop' gets three extra human sign-off pauses (see README's 'Optional human review gates').",
-  "labels": {
-    "entry": "Loop",
-    "entryId": 1336,
-    "exit": "Merged",
-    "exitId": 707,
-    "blocked": "Needs Human",
-    "blockedId": 1337,
-    "review": "",
-    "testcaseReview": "TestCase Review",
-    "testcaseReviewId": 1342,
-    "designReview": "",
-    "notABug": "",
-    "inReview": "In Review"
-  },
-  "_comment_inReview": "Added while a ticket's MR waits for a person to merge it, removed when the run finishes (merged) or blocks. Not the same as `review`, which is what makes a ticket need human sign-off. Empty or absent disables it.",
-  "_comment_designReview": "A SIXTH, OPTIONAL, board-only label, EMPTY (off) by default \u2014 set it to an existing project label to switch it on. Exactly the testcaseReview mechanism, for the design gate: added when that gate first posts its request, removed when it resolves, gating nothing itself. It is empty rather than pre-filled because a swap naming a label that is not on the project is silently dropped \u2014 so a default of 'Design Review' would look configured and do nothing. Note it is NOT the 'Design' label: that one is what puts a ticket through the design phase at all and is listed under preserveLabels.",
-  "_comment_testcaseReview": "A FIFTH, OPTIONAL, board-only label, EMPTY (off) by default. swapLabel adds it the moment the testcases gate first posts its request comment (a QA sign-off is now pending) and removes it the moment that gate is approved -- see src/conductor/reviewgate.ts. It never gates anything itself and is never required alongside 'Loop'; its only job is letting a board view tell 'parked at testcases QA review' apart from every other parked/blocked reason. Empty string turns it off, same as leaving 'review' unset. Must exist on the project before relying on it, same rule as every other label here.",
-  "_comment_reviewAllRuns": "TRUE = the review gates apply to EVERY run, not only tickets carrying the Review label or touching highScrutinyPaths. This is a deliberate change of posture: with it on, every run pauses after `plan` and after `testcases` for a human, and never merges its own MR. The path list still works and is still worth keeping \u2014 it is what makes a gate survive this being switched back off. The label trigger works only once labels.review names a label that exists on the project; it is empty in this config, so no ticket is gated by a label. Requires channels:history (or groups:history) on the Slack bot token; without it every gate sits 'pending' forever and every run parks, which is why doctor FAILS rather than warns while this is true.",
-  "reviewAllRuns": true,
-  "_comment_bugReproduction": "TRUE = before planning a fix, research reproduces a reported BUG on the base branch in the real app (skill: bug-reproduction). This is the project-wide switch, not the per-ticket one: a run only reproduces when the ticket ALSO carries the label mapped to bug-reproduction in config/phases.json (`Bug`), because bring-up and login are paid whether or not the ticket turns out to be a bug. An unlabelled ticket records 'not-applicable' and never starts the app. If the steps run and the correct behaviour is observed, the run PARKS on the Not a Bug gate: the evidence and screenshots are posted on the ticket and a QA reviewer from config/reviewers.json decides. Any other comment from them is feedback, and research reproduces again with it in its prompt. Only their `approved` stops the run: the entry label is removed, labels.notABug is added in its place WHEN ONE IS SET, and the evidence is posted as a ticket comment and in the Slack channel. labels.notABug is empty in this config, so the ticket is left with neither label and the verdict lives in that comment and the Slack post. Features, no-UI changes and anything that could not be run to the end (inconclusive) carry on as before. To overrule the verdict, add Loop back (and remove labels.notABug, if one was set): the run resumes at plan without reproducing again. A non-empty labels.notABug must exist on the project. FALSE switches the step off.",
+  "_comment": "Everything Solo knows about the project that GITLAB_REPO_URL does not say. Labels must exist on the project; doctor checks. `merge.mode` auto = merge when the gate passes (Loop is the consent); manual = stop at In Review.",
+  "labels": { "entry": "Loop", "exit": "Merged", "inReview": "In Review", "blocked": "Needs Human" },
+  "preserveLabels": ["AI", "Agentic", "Minor", "Major", "No QA", "Design"],
+  "branches": { "base": "dev", "protected": ["dev", "stage", "master", "main"], "prefix": "oneshot" },
+  "merge": { "mode": "auto" },
   "bugReproduction": true,
-  "_comment_high_scrutiny": "Paths the ERP's own .claude/rules/security.md marks 'escalate immediately'. A ticket whose PLAN or DIFF touches one gets the Review gates even without the Review label, because the label is human-applied and therefore forgettable \u2014 and the tickets most worth pausing on are exactly the ones nobody remembers to label. Matching is a plain substring test against repo-relative paths, so 'apps/payroll/' catches everything under it. The paths now live in config/risk-modules.json (the `paths` of every module) and are merged into this array at load. They gate review only: the Plane triage router no longer reads that file, it routes by the ERP repo's own .claude/zones.json. To disarm the path trigger, remove the module's `paths` in config/risk-modules.json \u2014 emptying this array alone does nothing. Add a one-off path here only if it has no module.",
-  "highScrutinyPaths": [],
-  "_comment_markers": "Persistent labels Oneshot must copy through untouched on any label write. A label swap is one update_issue call carrying the full array, so anything not listed here and not the entry/exit label would be silently dropped.",
-  "preserveLabels": [
-    "AI",
-    "Agentic",
-    "Minor",
-    "Major",
-    "No QA",
-    "Design"
-  ],
-  "_comment_zones": "The delivery-zone guard (src/conductor/zoneguard.ts) is SWITCHED OFF: there is no `zones` block, so zoneGuardApplies() and refusedTicket() return false/null and no run is checked against a zone or refused for a label. Its only input, the ERP repo's .claude/zones.json, is not on ERP origin/dev yet (it arrives with arbisoft/erp!11060), and an enabled guard fails closed on a map it cannot read, so switching it on now would stop every AI ticket. To switch it on once `git -C \"$WORK_REPO\" show origin/dev:.claude/zones.json` succeeds, add this one line here: \"zones\": { \"file\": \".claude/zones.json\", \"guardLabel\": \"AI\", \"yellowLabel\": \"Zone: Yellow\", \"testsLabel\": \"Characterization Tests\" }, and dry-run one AI ticket. With it on, an AI-labelled ticket whose plan or branch diff leaves green (or green+yellow on a ticket carrying yellowLabel) is blocked, red never runs, and a testsLabel ticket is refused before any phase. yellowLabel is grooming's classification of the ticket, not proof its characterization tests merged: the release is Loop, which the pm-loop sweep adds only after the tests-only MR merges, and the guard trusts that rather than checking it. Remove the line to switch it off again.",
-  "_comment_branches": "base is what ticket branches are cut from and what their MRs target. Do not infer it from the project's GitLab default branch, which need not be 'dev'. Everything in protected is refused by the git guard whatever the server would allow \u2014 which is why 'main' is listed even on a project that does not have it, or where it reports can_push=true for our token. doctor WARNs about a listed branch the project does not have, and FAILs one that exists but is not protected on GitLab: on a project with an unprotected 'main', protect it there or remove it from this list.",
-  "branches": {
-    "base": "dev",
-    "protected": [
-      "dev",
-      "stage",
-      "master",
-      "main"
-    ],
-    "prefix": "oneshot",
-    "pattern": "oneshot/ticket-<iid>-<slug>"
-  },
-  "_comment_promotion": "dev is FINAL. A ticket MR merges into base and the run is done \u2014 nothing is promoted onward. dev -> stage is deliberately absent rather than auto:false, because auto:false reads as 'a human owns this hop' (which is what it means for stage -> master) and that is not the reason here: the hop is switched off while the pipeline earns trust. With no entry whose `from` is the base branch, runPromotions() records no promotion and merge reports 'no automatic promotion applies to this base'. Restore by putting { from: dev, to: stage, auto: true } back \u2014 nothing else has to change, and note that config/deploy.json already ships dev (defaultRef), so the deploy never depended on this hop. stage -> master stays listed and stays manual: production release is a human act.",
-  "promotions": [
-    {
-      "from": "stage",
-      "to": "master",
-      "auto": false
-    }
-  ],
-  "automation": {
-    "_why": "The Ready For Automation mode (src/automation). It runs only on a desk with ONESHOT_AUTOMATION=1, or by hand with --automation <iid>. It reads tickets carrying BOTH the Loop's entry label (`labels.entry`, the master switch: neither scan picks up a ticket without it) and `labels.trigger` (open or closed, any assignee), proves them ready with hooks/automation-ready.cjs (which also reports `loop-missing` when the entry label is gone, a silent stop like a removed trigger), has one session write the automation test cases, waits for a QA approver (config/reviewers.json qa) to comment `approved`, then writes them to the sheet below and, in one atomic edit, removes `labels.review` and the entry label and adds `labels.done`. The entry label goes too because a finished ticket must not read as work still asked for. The Loop pipeline never works a ticket carrying `labels.trigger`, even on a desk where this mode is off: its scan asks GitLab to leave it out (and skips one that slips through) and --ticket refuses it. Remove this block, or leave any field in it unusable (boot names which), and this mode cannot run, so there is no trigger to route on and the Loop behaves as it did before this mode existed. Apart from taking the entry label off at the end, it never touches the Loop's labels or state.",
-    "_why_labels": "Exact, case-sensitive names that must already exist on the project. Oneshot never creates labels. Verified on 2026-09-28 against arbisoft/erp: 'Ready For Automation' (1338, renamed from 'Ready for Automation'), 'Ready For Deployment' (423), 'Automation Test Case Review' (1340) and 'Automation Done' (1339). `deployed` is read, never written. It is the label that must have been ADDED before the trigger on an open ticket.",
-    "labels": {
-      "trigger": "Ready For Automation",
-      "deployed": "Ready For Deployment",
-      "review": "Automation Test Case Review",
-      "done": "Automation Done"
-    },
-    "_why_releaseBranchPattern": "Source branches that make an MR a branch PROMOTION, not a fix. Together with branches.protected: a 'stage \u2192 dev' MR that mentions a ticket is not the change that fixed it. Release branches are named Adhoc-YYYY-MM-DD. The hook compiles this source with the 'i' flag, so adhoc-\u2026 matches too.",
-    "releaseBranchPattern": "^Adhoc-\\d{4}-\\d{2}-\\d{2}$",
-    "_why_sheet": "Where approved cases go. `spreadsheetId` ships as the placeholder REPLACE_ME, which the automation preflight refuses by name, so no desk can switch this mode on against a sheet nobody chose: which sheet main files approved cases into is a decision, not a default. Pointing it at the team's sheet takes TWO values: its spreadsheetId, and `trackerTab` set to the team's 'Test Cases Updates [{year}]'; with only the id changed, this mode would add its own 'TestCases year {year}' tab beside the team's tracker, where QA does not look. `trackerTab` is a title pattern: {year} is replaced with the year QA approved, and the tab is created with its header on row 1 if missing. The real team sheet uses 'Test Cases Updates [{year}]' with its header on row 2, two frozen rows and strict status validation; a tracker this mode creates has none of that, so copy the format across once a year. `moduleTabPrefix` names a module tab this mode has to CREATE. Existing tabs are found by normalised name whatever their prefix. `sectionAliases` maps a module name to the tracker's column-A text when the two are spelt differently and the module tab's own links do not reveal the section. Oneshot marks the rows it writes with developer metadata (key oneshot-automation), so it never mistakes the team's own rows for its own. The service account in ONESHOT_GOOGLE_SA_FILE must be an Editor on this spreadsheet.",
-    "sheet": {
-      "spreadsheetId": "REPLACE_ME",
-      "trackerTab": "TestCases year {year}",
-      "moduleTabPrefix": "TestCases_",
-      "sectionAliases": {}
-    },
-    "_why_recheckMinutes": "A not-ready ticket is re-checked when it changes, and otherwise at this interval. Merging an MR does not touch the ticket's updated_at, so waiting for a change alone would miss the most common fix.",
-    "recheckMinutes": 30
-  },
-  "_comment_concurrency": "In-flight TICKET cap. The old MUST-STAY-1 constraint is now carried by the promotion mutex (src/lib/promotion.ts): the deploy script ships the TIP of dev, so exactly one run may occupy the merge\u2192deploy\u2192qa window at a time \u2014 that is where attribution lives, and the mutex enforces it while every other phase pipelines freely. Residual cap reasons: worktrees symlink ONE shared node_modules/venv (a second webpack build during another run's verify contends on the babel cache), and the port pool (PORT_POOL, default 3) bounds server-holding phases. Raise toward the pool size once shared-cache contention is observed to be tolerable. Set to 1 deliberately: the operator runs one ticket per loop and scales by starting more conductors, so the fleet-wide ceiling is PORT_POOL and each process holds exactly one run \u2014 which also keeps the shared node_modules/venv contention this comment warns about at one build per conductor.",
-  "concurrency": 1
+  "hookPack": "erp",
+  "seed": {
+    "links": ["venv", "node_modules", "staticfiles"],
+    "copies": ["hrdb/local_settings.py", "frontend/src/constants/config.js"]
+  }
 }

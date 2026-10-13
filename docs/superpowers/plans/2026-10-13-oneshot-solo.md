@@ -2398,6 +2398,331 @@ Then append a dated *Status* section to `HANDOFF.md` stating: tests/hook counts,
 
 ---
 
+### Task 14: Guards from the usage report — no `git stash`, no whole-file rewrites
+
+Added 2026-10-13 from the operator's Claude Code Insights report (`~/.claude/usage-data/report-2026-10-13-133914.html`, "Where Things Go Wrong"): a leftover `git stash` reverted commits and was blamed on a concurrent process; an agent pass rewrote `actionTypes.js` and net-deleted ~1,177 lines to change one line. Both are mechanical to prevent.
+
+**Files:**
+- Modify: `hooks/git-guard.cjs` (add `checkStash` beside `checkBranchDelete`; call it from the same per-segment loop that calls `checkPush`/`checkBranchDelete`)
+- Create: `hooks/churn-guard.cjs`
+- Modify: `src/ticket/hooks.ts` (register `churn-guard.cjs` as a core PreToolUse guard on `^Write$`, after `write-scope.cjs`), `src/ticket/hooks.test.ts` (the core-guard assertion gains it)
+- Modify: `scripts/verify-hooks.sh` (cases below), `docs/HOOKS.md` (two rows), `skills/ship-ticket/SKILL.md` (two **Do not** bullets)
+
+**Interfaces:**
+- Consumes: `hooks/_common.cjs` (`readInput`, `deny`, `allow`, `event`, `bailIfNotOneshot`), the `ONESHOT_WORKTREE` env the session carries.
+- Produces: nothing new for other tasks; `hooksFor()` keeps its signature.
+
+- [ ] **Step 1: Add the suite cases first (they fail)**
+
+Append to `scripts/verify-hooks.sh` before the summary:
+
+```bash
+echo "git-guard (stash)"
+expect_deny  "git stash"                 git-guard.cjs "$(bash_payload 'git stash')"
+expect_deny  "git stash push -m wip"     git-guard.cjs "$(bash_payload 'git stash push -m wip')"
+expect_deny  "git stash pop"             git-guard.cjs "$(bash_payload 'git stash pop')"
+expect_deny  "chained stash"             git-guard.cjs "$(bash_payload 'git add -A && git stash')"
+expect_allow "git stash list (read-only)" git-guard.cjs "$(bash_payload 'git stash list')"
+expect_allow "a commit mentioning stash" git-guard.cjs "$(bash_payload 'git commit -m "remove stash helper"')"
+
+echo "churn-guard"
+CHURN_DIR="$ONESHOT_WORKTREE/churn"; mkdir -p "$CHURN_DIR"
+seq 1 100 | sed 's/^/line /' > "$CHURN_DIR/big.js"
+churn_payload() { printf '{"tool_name":"Write","tool_input":{"file_path":"%s","content":%s}}' "$1" "$(printf '%s' "$2" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.stringify(s)))')"; }
+expect_deny  "Write shrinks a 100-line file to 3 lines" churn-guard.cjs "$(churn_payload "$CHURN_DIR/big.js" $'a\nb\nc\n')"
+expect_allow "Write keeps most of the file"             churn-guard.cjs "$(churn_payload "$CHURN_DIR/big.js" "$(seq 1 80 | sed 's/^/line /')")"
+expect_allow "Write to a new file"                      churn-guard.cjs "$(churn_payload "$CHURN_DIR/new.js" $'a\nb\n')"
+expect_allow "Write shrinks a tiny file"                churn-guard.cjs "$(churn_payload "$CHURN_DIR/small.js" 'x')"
+printf 'one\ntwo\nthree\n' > "$CHURN_DIR/small.js"
+expect_allow "Edit is never judged"                     churn-guard.cjs '{"tool_name":"Edit","tool_input":{"file_path":"'"$CHURN_DIR"'/big.js","old_string":"line 1","new_string":"x"}}'
+```
+
+Run: `bash scripts/verify-hooks.sh | tail -3` → the new deny cases FAIL (git-guard allows stash; churn-guard.cjs is missing).
+
+- [ ] **Step 2: `checkStash` in git-guard**
+
+```js
+/**
+ * `git stash` is banned in a leased worktree. A stash is state the conductor
+ * cannot see: in ticket #8878 a leftover stash/pop sequence reverted commits
+ * and the session blamed a concurrent process. Setting work aside is a WIP
+ * commit on the leased branch; reading the stash list stays allowed.
+ */
+function checkStash(t) {
+  if (t[0] !== 'git' || t[1] !== 'stash') return;
+  const sub = t[2] || 'push';
+  if (sub === 'list' || sub === 'show') return;
+  C.event('denied_stash', { cmd: t.join(' ') });
+  C.deny(
+    `Denied: \`git stash\` is not available in a leased worktree (${sub}).\n` +
+    'A stash is state nothing else can see, and a leftover one has silently reverted a ' +
+    'run\'s commits before. To set work aside, commit it as WIP on the leased branch ' +
+    '(`git commit -m "wip: …"`) and amend or squash later.',
+  );
+}
+```
+
+`t` is the token array the existing per-segment loop already builds for `checkPush` (read how `checkBranchDelete(t, cfg)` is invoked and call `checkStash(t)` right after it).
+
+- [ ] **Step 3: `hooks/churn-guard.cjs`**
+
+```js
+#!/usr/bin/env node
+'use strict';
+/**
+ * PreToolUse on Write: a Write that replaces an existing file with far less
+ * than it had is almost always a partial change done as a whole-file rewrite
+ * — the Claude Code Insights report for this desk counted one pass that
+ * net-deleted ~1,177 lines of actionTypes.js to change a single line, and
+ * two sessions redoing that work. Edit is the tool for partial changes; this
+ * guard says so at the moment it matters, before the file is gone.
+ *
+ * Rule: deny when the target exists with >= MIN_LINES lines and the new
+ * content has fewer than KEEP of them. Below MIN_LINES, or for a new file,
+ * or for Edit/NotebookEdit, it has no opinion.
+ */
+const fs = require('node:fs');
+const path = require('node:path');
+const C = require(path.join(__dirname, '_common.cjs'));
+
+C.bailIfNotOneshot();
+
+const MIN_LINES = 40;
+const KEEP = 0.5;
+
+function lines(s) { return s.length ? s.split('\n').length : 0; }
+
+try {
+  const data = C.readInput();
+  if (data.tool_name === 'Write') {
+    const input = data.tool_input || {};
+    const file = typeof input.file_path === 'string' ? input.file_path : '';
+    const content = typeof input.content === 'string' ? input.content : null;
+    if (file && content !== null && fs.existsSync(file) && fs.statSync(file).isFile()) {
+      const before = lines(fs.readFileSync(file, 'utf8'));
+      const after = lines(content);
+      if (before >= MIN_LINES && after < before * KEEP) {
+        C.event('denied_churn', { file, before, after });
+        C.deny(
+          `Denied: this Write would replace ${file} (${before} lines) with ${after} lines.\n` +
+          'A whole-file Write that drops most of a file is how a one-line change once deleted ' +
+          '~1,177 lines. Use Edit for a partial change (old_string → new_string), or, if the ' +
+          'file really should shrink this much, delete the lines with Edit in steps so each ' +
+          'removal is reviewable in the diff.',
+        );
+      }
+    }
+  }
+} catch (err) {
+  C.logFailure('churn-guard', err);
+}
+
+C.allow();
+```
+
+Check `_common.cjs` for the exact helper names (`readInput`, `deny`, `allow`, `event`, `logFailure`, `bailIfNotOneshot`) and use them as the other guards do.
+
+- [ ] **Step 4: Register it; document it; tell the session**
+
+`src/ticket/hooks.ts`: in the core `PreToolUse` list add `{ matcher: '^Write$', hooks: [core('churn-guard.cjs')], timeout: 15 }` immediately after the `write-scope.cjs` entry. `src/ticket/hooks.test.ts`: the core-guard test asserts `pre.includes('^Write$')`.
+
+`docs/HOOKS.md`: add rows for `churn-guard.cjs` (core, PreToolUse Write, the rule above) and for git-guard's new `git stash` denial.
+
+`skills/ship-ticket/SKILL.md`, under **Do not**, append:
+
+```
+- Do not `git stash` in the worktree (the guard denies it). Set work aside with a WIP commit
+  on your branch; a leftover stash once reverted a run's commits and looked like a race.
+- Do not rewrite a whole file to change a few lines. Use Edit; the guard denies a Write
+  that drops most of an existing file. After each edit, `git diff --stat` — deletions far
+  larger than intended mean restore the file and re-apply only the change you meant.
+```
+
+- [ ] **Step 5: Run everything**
+
+Run: `bash scripts/verify-hooks.sh | tail -3 && npx tsx --test src/ticket/hooks.test.ts && node --check hooks/churn-guard.cjs && npm run check`
+Expected: suite `failed 0` (145 cases), hooks tests pass, check clean except scripts/doctor.ts if Task 12 has not landed.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add hooks/git-guard.cjs hooks/churn-guard.cjs src/ticket/hooks.ts src/ticket/hooks.test.ts scripts/verify-hooks.sh docs/HOOKS.md skills/ship-ticket/SKILL.md
+git commit -q -m "feat(hooks): deny git stash in the worktree; churn-guard denies whole-file rewrites
+
+From the Claude Code Insights report: a leftover stash reverted a run's
+commits, and a one-line change once net-deleted ~1,177 lines.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 15: Start a ticket from the dashboard
+
+Added 2026-10-14 from the operator: "instead of running a command it should automatically initialize the session if I just write the ticket name in [the dashboard] and start to run [a] loop on it", and "I do need to know the current running ticket".
+
+**Files:**
+- Create: `src/lib/queue.ts`, `src/lib/queue.test.ts`
+- Modify: `scripts/serve.ts` (ticket box + `POST /run` + conductor status/start), `scripts/serve.test.ts`, `src/index.ts` (queued tickets dispatched before the scan), `src/ticket/scan.ts` only if the skip-reason text needs it, `scripts/status.ts` (queued rows), `README.md` (one section), `HANDOFF.md` (one paragraph)
+
+**Interfaces:**
+- Consumes: `STATE`, `PID_FILE` (config), `pidAlive` (journal), `allRuns` (telemetry), `runTicket(iid, { signal, force })` (run.ts).
+- Produces:
+  ```ts
+  // src/lib/queue.ts — the dashboard's hand-off to the conductor: one file per ticket under state/queue/
+  export const QUEUE_DIR: string;                         // join(STATE, 'queue')
+  export interface QueueEntry { iid: number; requestedAt: number; by: 'dashboard' | 'cli' }
+  export function enqueue(iid: number, by?: QueueEntry['by']): QueueEntry;   // idempotent: re-enqueue returns the existing entry
+  export function queued(): QueueEntry[];                 // oldest first
+  export function dequeue(): QueueEntry | null;           // removes and returns the oldest
+  export function remove(iid: number): boolean;
+  export function conductorLive(): { live: boolean; pid: number | null };    // PID_FILE + pidAlive
+  export function startConductor(): { started: boolean; pid?: number; why?: string };  // spawn `npm start` detached, log to state/conductor.log; refuses when live
+  ```
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/lib/queue.test.ts` (imports `./test-scratch-home.js` FIRST so STATE is a temp dir):
+
+```ts
+import './test-scratch-home.js';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { enqueue, queued, dequeue, remove, conductorLive, QUEUE_DIR } from './queue.js';
+import { PID_FILE } from './config.js';
+import { dirname } from 'node:path';
+
+test('enqueue is idempotent and queued() is oldest-first', () => {
+  const a = enqueue(412, 'dashboard'); const b = enqueue(99); const again = enqueue(412);
+  assert.equal(again.requestedAt, a.requestedAt);
+  assert.deepEqual(queued().map((q) => q.iid), [412, 99]);
+  assert.equal(b.by, 'cli');
+});
+test('dequeue removes the oldest; remove() deletes by iid', () => {
+  assert.equal(dequeue()!.iid, 412);
+  assert.equal(remove(99), true);
+  assert.equal(remove(99), false);
+  assert.equal(dequeue(), null);
+});
+test('a malformed queue file is skipped, not fatal', () => {
+  mkdirSync(QUEUE_DIR, { recursive: true });
+  writeFileSync(`${QUEUE_DIR}/notanumber.json`, '{');
+  assert.deepEqual(queued(), []);
+});
+test('conductorLive reads the pid file', () => {
+  mkdirSync(dirname(PID_FILE), { recursive: true });
+  writeFileSync(PID_FILE, `${process.pid}\n`);
+  assert.deepEqual(conductorLive(), { live: true, pid: process.pid });
+  writeFileSync(PID_FILE, '999999\n');
+  assert.equal(conductorLive().live, false);
+});
+```
+
+Add to `scripts/serve.test.ts`:
+
+```ts
+test('POST /run queues a valid iid and rejects the rest', async () => {
+  const { handleRun } = await import('./serve.js');
+  assert.deepEqual(await handleRun('iid=412'), { code: 303, location: '/?queued=412' });
+  assert.equal((await handleRun('iid=abc')).code, 400);
+  assert.equal((await handleRun('iid=-1')).code, 400);
+  assert.equal((await handleRun('')).code, 400);
+  const { queued } = await import('../src/lib/queue.js');
+  assert.deepEqual(queued().map((q) => q.iid), [412]);
+});
+test('the index shows queued tickets and the conductor state', async () => {
+  const { index } = await import('./serve.js');
+  const html = index();
+  assert.ok(html.includes('name="iid"'));                 // the ticket box
+  assert.ok(html.includes('#412') && html.includes('queued'));
+  assert.ok(/conductor (running|not running)/.test(html));
+});
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `npx tsx --test src/lib/queue.test.ts scripts/serve.test.ts`
+Expected: FAIL — `./queue.js` missing; `handleRun`/`index` not exported.
+
+- [ ] **Step 3: Implement `src/lib/queue.ts`**
+
+One JSON file per ticket at `state/queue/<iid>.json` holding `QueueEntry`; `queued()` lists `*.json`, parses each (skip on error), sorts by `requestedAt`; `enqueue` returns the existing entry when the file exists; `dequeue` = `queued()[0]` + `rmSync`. `conductorLive()` reads `PID_FILE` and uses `pidAlive`. `startConductor()`: if live → `{ started: false, why: 'already running (pid N)' }`; else `spawn(process.execPath, [join(ROOT, 'node_modules/tsx/dist/cli.mjs'), join(ROOT, 'src/index.ts')], { cwd: ROOT, detached: true, stdio: ['ignore', fd, fd], env: process.env })` with `fd = openSync(join(STATE, 'conductor.log'), 'a')`, then `child.unref()` and return `{ started: true, pid: child.pid }`. (No `npm` wrapper on purpose — oneshot learned a killed `npm` orphans its `tsx` child.)
+
+- [ ] **Step 4: Dashboard — the box, the queue, the conductor**
+
+`scripts/serve.ts`:
+- Export `index()` and `handleRun(body: string): Promise<{ code: number; location?: string; body?: string }>`: parse `iid` from a urlencoded body; a positive integer → `enqueue(iid, 'dashboard')` → `{ code: 303, location: '/?queued=<iid>' }`; anything else → `{ code: 400, body: 'iid must be a positive ticket number' }`.
+- Routes: `POST /run` (read the body, ≤ 1 KB, call `handleRun`, send 303 with `Location` or the 400 text); `POST /conductor/start` → `startConductor()` → 303 to `/`; everything else unchanged. Only `POST` mutates; `GET /run` is not a route.
+- `index()`: above the table, a one-line form `<form method="post" action="/run"><input name="iid" inputmode="numeric" pattern="[0-9]+" placeholder="ticket number" required> <button>Run</button></form>`; a line `conductor running (pid N)` or `conductor not running — <form method="post" action="/conductor/start"><button>Start it</button></form>`; a `queued` block listing `queued()` entries (`#412 · queued 3m ago · from dashboard`) when non-empty; the live run (the row whose summary has `live: true`) gets a `● running` marker in its status pill and is listed first; a `?queued=<iid>` query shows a one-line notice "#<iid> queued — the conductor picks it up on its next tick (within 60 s)".
+- Keep the server bound to 127.0.0.1 (it is); no auth is added — it is local-only, and `POST` from another origin is blocked by a same-origin check on the `Origin`/`Referer` header when present (reject if the host is not `127.0.0.1:<port>` or `localhost:<port>`).
+
+`scripts/status.ts`: print a `queued: #412, #99` line above the table when the queue is non-empty, and `conductor: running (pid N)` / `conductor: not running` as the first line.
+
+- [ ] **Step 5: Conductor — queued tickets go first**
+
+`src/index.ts` `tick()`: after the pause/quota checks and before `--ticket` handling, `const q = dequeue(); if (q) { log.phase(\`queued    #${q.iid} (from ${q.by})\`); running = runTicket(q.iid, { signal: aborter.signal, force: true }).…; return; }` — but only when no run is live (`running === null`); if one is live, leave the queue untouched and log `queued #N waits for the current run` once per tick. A queued ticket is dispatched exactly like `--ticket`: `force: true`, no `Loop` label required, the claim/resume/refuse rules unchanged. Add a focused test only if `tick` is already testable; otherwise cover the dispatch helper you extract (`export function takeQueued(): QueueEntry | null` that returns null when a run is live) with one unit test.
+
+- [ ] **Step 6: Docs**
+
+README: a short section *Starting a ticket from the dashboard* (type the number, press Run, the conductor must be running — the page says and can start it; the queue lives in `state/queue/`). HANDOFF: one paragraph under *Run it*.
+
+- [ ] **Step 7: Run everything**
+
+Run: `npm run check && npm test && bash scripts/verify-hooks.sh | tail -1`, then start the dashboard on a spare port, `curl -s -X POST -d iid=1 http://127.0.0.1:<port>/run -o /dev/null -w '%{http_code}\n'` → 303, `ls state/queue/` shows `1.json`, `curl -s http://127.0.0.1:<port>/ | grep -c queued` ≥ 1, then `rm state/queue/1.json`. Do not start the conductor.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/lib/queue.ts src/lib/queue.test.ts scripts/serve.ts scripts/serve.test.ts scripts/status.ts src/index.ts README.md HANDOFF.md
+git commit -q -m "feat(dashboard): queue a ticket from the dashboard; the conductor runs it next
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 16: Residuals from the final re-review
+
+Added 2026-10-14 from the scoped re-review of the final fix wave (`.superpowers/sdd/2026-10-13-oneshot-solo/final-rereview-report.md`). Four small corrections and one documentation line; runs after Task 15 in the main checkout.
+
+**Files:**
+- Modify: `src/ticket/finish.ts` (+ `finish.test.ts`), `src/ticket/session.ts` (+ `session.test.ts`), `src/ticket/prompt.ts` (one sentence; + `prompt.test.ts`), `src/ticket/run.ts` (+ `run.test.ts`), `hooks/secret-guard.cjs` (+ `scripts/verify-hooks.sh` cases), `README.md` (one sentence)
+
+**Interfaces:** none new. `leaseFor` keeps its injected `LeaseDeps`; add `mrState?: (mrIid: number) => Promise<'merged' | 'opened' | 'closed' | 'unknown'>` to it (default: `getMergeRequest` → `data.state`, `'unknown'` on failure).
+
+- [ ] **Step 1: Failing tests first**
+
+1. `finish.test.ts`: with deps whose `editIssueLabels` throws once, `finish()` on a done outcome leaves the journal status NOT terminal (still `running`) and `merged`/`mrIid` recorded; a second `finish()` with a blocked outcome then labels `Needs Human` (so the catch-all path works). With deps that succeed, the journal ends `done` as before.
+2. `session.test.ts`: `sessionMcpServers(iid, { projectId: 123 })` (or however the id reaches it today) sets `GITLAB_ALLOWED_PROJECT_IDS` to exactly `'123'` and `GITLAB_PROJECT_ID` to `'123'`; without an id, neither is set and no multi-entry allowlist exists.
+3. `prompt.test.ts`: the prompt contains the sentence naming `$ONESHOT_PROJECT_ID` as the `project_id` to pass to every GitLab tool.
+4. `run.test.ts`: (a) a `done` + `merged:true` journal → the new lease's branch is `<branch>-<6>` even when `deleteLocalBranch` succeeds; (b) a `done` + `merged:false` journal whose `mrIid` the injected `mrState` reports `'merged'` takes the same path; (c) `mrState` `'opened'` keeps today's re-attach behaviour.
+5. `verify-hooks.sh`: `expect_deny "Grep rooted at ONESHOT_HOME" secret-guard.cjs '{"tool_name":"Grep","tool_input":{"pattern":"GITLAB_TOKEN","path":"'"$ONESHOT_HOME"'"}}'`; `expect_deny "Grep rooted above ONESHOT_HOME"` with `path` = `$(dirname "$ONESHOT_HOME")`; `expect_allow "Grep inside the worktree"` with `path` = `$ONESHOT_WORKTREE`; `expect_allow "Grep with no path (cwd = worktree)"` with no `path` key.
+
+Run them → FAIL.
+
+- [ ] **Step 2: Implement**
+
+- `finish.ts`: in the `done` and `blocked` paths, perform the GitLab calls first, then `updateJournal(..., { status })`; keep `mrIid/mrUrl/merged/blockedWhy` writes early so the dashboard sees them even if a later call throws. The early-return guard for an already-terminal journal stays.
+- `session.ts` `sessionMcpServers`: `GITLAB_ALLOWED_PROJECT_IDS = String(projectId)` only when known; `GITLAB_PROJECT_ID` the same; never the path.
+- `prompt.ts`: in MR_CONTRACT (or the Method block), one sentence: "Every GitLab tool call passes `project_id: $ONESHOT_PROJECT_ID` (the numeric id the conductor resolved; the server refuses other projects)."
+- `run.ts` `leaseFor`: `const wasMerged = existing.merged === true || (existing.mrIid ? (await deps.mrState(existing.mrIid)) === 'merged' : false)`; when `wasMerged`: reap, `deleteLocalBranch` (best effort), then lease under `suffixed(branch, runId)` always.
+- `secret-guard.cjs`: for `Grep` (and `Glob` if it is matched), resolve `tool_input.path` (absent → allow; the session's cwd is the worktree); deny when the resolved directory equals `ONESHOT_HOME` or is an ancestor of `ONESHOT_HOME/.env`'s directory; message: "search inside your worktree — the harness root holds .env".
+- `README.md` (Config or Running section): "The app bring-up gets the same allowlisted environment as the session plus `app.cjs`'s own `.env` load; shell-only variables (for example `PG*`) do not reach Django — put them in `.env`."
+
+- [ ] **Step 3: Gates and commit**
+
+`npm run check && npm test && bash scripts/verify-hooks.sh | tail -1 && npm run doctor -- --no-probe | tail -1`, then:
+
+```bash
+git add src/ticket/finish.ts src/ticket/finish.test.ts src/ticket/session.ts src/ticket/session.test.ts src/ticket/prompt.ts src/ticket/prompt.test.ts src/ticket/run.ts src/ticket/run.test.ts hooks/secret-guard.cjs scripts/verify-hooks.sh README.md
+git commit -q -m "fix(ticket,guards): journal status after GitLab; single-entry project allowlist; merged re-runs take a fresh branch; no grep at the harness root
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
 ## Plan self-review (done at authoring time)
 
 - **Spec coverage.** §3 flow → Tasks 9, 10, 11. §4.1 spawn → Task 9. §4.2 env → Task 9 (`sessionEnv`), Task 2 (`BASE_ENV`). §4.3 tool policy → Task 8 (`DENIED_TOOLS`). §4.4 prompt → Task 8. §4.5 schema → Task 8. §4.6 skills/context → Tasks 4, 7. §4.7 compaction/recovery → Tasks 8 (prompt), 11 (`attemptLoop`). §5.1 tick → Task 11. §5.2 claim/prepare → Tasks 4, 11. §5.3 outcome → Task 10. §5.4 finish/merge → Tasks 10, 11. §6 telemetry → Task 5. §7.1 `.env` → Task 1. §7.2 project.json → Tasks 1, 2. §7.3 setup/doctor/probe → Task 12. §7.4 deps → Task 1. §8 hooks → Task 6. §9 layout → Task 1 + the file structure above. §10 tests → each task's Step 1; hooks suite Task 6; probe Task 12; live checklist Task 13. §11 out of scope → nothing planned for it. §12 risks → the probe (Task 12), `ONESHOT_SUPERPOWERS_INJECT` fallback (Task 9), artifacts-on-disk (Tasks 7, 8), MR post-check (Task 10), `ONESHOT_PHASE` assertion (Task 2 test + Task 6 suite export).

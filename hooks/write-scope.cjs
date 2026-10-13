@@ -15,7 +15,7 @@
  *      SKILL.md as "inside the worktree" while the write lands in context/ —
  *      letting an implement phase rewrite the skills that govern it,
  *      permanently, for every future run and every interactive session.
- *      C.isInside() realpath-resolves before comparing. See docs/HOOKS.md 4.1.
+ *      C.isInside() realpath-resolves before comparing. See docs/HOOKS.md §3.
  *
  *   2. The context repo (~/Documents/erp). It is read-only reference — Oneshot
  *      reads it for prior art and conventions and never writes to it. (Skills
@@ -50,9 +50,10 @@ function contextRepo() {
 }
 
 /**
- * Scopes are handed in by the conductor rather than derived here, so the
- * allowlist for a phase lives in config/phases.json next to everything else
- * about that phase instead of being duplicated in a hook table.
+ * Scopes are handed in by the conductor rather than derived here: in Solo,
+ * ONESHOT_WRITE_SCOPES is the run's worktree and its artifacts dir
+ * (state/runs/<iid>/artifacts), colon-separated, set in the session env by
+ * src/ticket/session.ts. run.json and the rest of state/ are outside it.
  */
 function allowedScopes() {
   return (process.env.ONESHOT_WRITE_SCOPES || '')

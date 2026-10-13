@@ -72,3 +72,19 @@ test('only the scoped path names are exempt from being extras', () => {
   assert.deepEqual(d.unknown, ['ONESHOT_FOO_BAR']);
   assert.equal(driftCount(d), 0);
 });
+
+test('every setting Solo dropped is stale, in either spelling, not an unknown extra', () => {
+  const dropped = ['SLACK_BOT_TOKEN=xoxb-1', 'BOARD_OPERATOR=me', 'LANGFUSE_HOST=https://lf', 'ONESHOT_OTEL=1',
+    'ONESHOT_WINDOW_TOKENS=1', 'ONESHOT_SKIP_PHASES=recall', 'ONESHOT_AUTOMATION=1', 'GITLAB_READ_TOKEN=glpat-r',
+    'GITLAB_MCP_CMD=npx', 'PORT_POOL=8000,8001', 'ONESHOT_FE_PORT=13002', 'ONESHOT_PHASE_IDLE_MIN=20',
+    'ONELOOP_CHANNEL=C1'];
+  const d = envDrift(`${FILLED}\n${dropped.join('\n')}`, TEMPLATE);
+  assert.deepEqual(d.stale.sort(), dropped.map((l) => l.split('=')[0]).sort());
+  assert.deepEqual(d.unknown, []);
+  assert.equal(driftCount(d), dropped.length);
+});
+
+test('ONESHOT_IDLE_MIN, the renamed idle watchdog, is not retired', () => {
+  const d = envDrift(`${FILLED}\nONESHOT_IDLE_MIN=15`, TEMPLATE);
+  assert.deepEqual(d.stale, []);
+});

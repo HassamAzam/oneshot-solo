@@ -124,8 +124,9 @@ export async function tokenIdentity(): Promise<TokenIdentity | null> {
  * The desk's username, resolved once and remembered.
  *
  * The assignee gate runs on every scan and cannot make a network call each time,
- * so index.ts resolves this at boot (via checkIdentity) and the watcher reads the
- * cached answer. Empty before boot has resolved it, which is the same "skip every
+ * so index.ts resolves this at boot (via checkIdentity) — and, when GitLab did
+ * not answer then, on each tick until it does (recheckIdentity) — and the scan
+ * reads the cached answer. Empty until then, which is the same "skip every
  * assigned ticket" behaviour as an unidentified desk — correct, because a desk
  * that does not yet know who it is must not claim anybody's work.
  */
@@ -195,6 +196,22 @@ export async function checkIdentity(): Promise<IdentityCheck> {
     }
   }
   return { username: token?.username ?? '', token, claudeUsername, warning };
+}
+
+/**
+ * Ask GitLab again who this desk is — only while nobody has answered yet and
+ * GitLab is reachable. Boot asks once and does not require GitLab, so a
+ * conductor started before the VPN was up would otherwise skip every assigned
+ * ticket for its whole life. The tick calls this; it is one cheap /user call
+ * per tick until it resolves, and nothing once it has. Returns the check when
+ * one was made, else null.
+ */
+export async function recheckIdentity(
+  reachable: boolean,
+  deps: { username: () => string; check: () => Promise<IdentityCheck> } = { username: deskUsername, check: checkIdentity },
+): Promise<IdentityCheck | null> {
+  if (deps.username() || !reachable) return null;
+  return deps.check();
 }
 
 /** One line for the boot banner. Never prints an email or a token. */

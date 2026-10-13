@@ -1,11 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readlinkSync } from 'node:fs';
-import { answerKeyCommits, detachTrackedClaude, runForkPoint, seedWorktree } from './worktrees.js';
+import { detachTrackedClaude, seedWorktree } from './worktrees.js';
+import { assertComposed, ensureClaudeDir } from './claudedir.js';
 import { SKILLS_ROOT } from './config.js';
 
 const git = (args: string[], cwd: string): string =>
@@ -144,147 +146,83 @@ test('a checkout that does not commit .claude is left alone', () => {
   }
 });
 
-/** A repo with `dev`, a branch cut from it, and a settable origin/dev. */
-function repoWithBranch(): { dir: string; base: string; tip: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'oneshot-fp-'));
-  git(['init', '-q', '-b', 'dev'], dir);
-  git(['config', 'user.email', 'test@example.com'], dir);
-  git(['config', 'user.name', 'Test'], dir);
-  writeFileSync(join(dir, 'a.txt'), 'base\n');
-  git(['add', '-A'], dir);
-  git(['commit', '-qm', 'base'], dir);
-  const base = git(['rev-parse', 'HEAD'], dir);
-  git(['checkout', '-q', '-b', 'oneshot/ticket-1-x'], dir);
-  writeFileSync(join(dir, 'a.txt'), 'the fix\n');
-  git(['commit', '-qam', 'the fix the plan is scored on finding'], dir);
-  const tip = git(['rev-parse', 'HEAD'], dir);
-  git(['update-ref', 'refs/remotes/origin/dev', base], dir);
-  return { dir, base, tip };
-}
+// ------------------------------------------- what a Solo session may not see
 
-test('runForkPoint returns where the branch left the base, not its tip', () => {
-  const { dir, base, tip } = repoWithBranch();
+test('planning-methodology and the approval-stopping agents are never composed', () => {
+  // They stop and wait for a human to approve the plan; a Solo session has
+  // nobody to wait for, and would idle out its budget.
+  const dir = repoWithCommittedClaude();
   try {
-    const got = runForkPoint('oneshot/ticket-1-x', dir);
-    assert.equal(got, base);
-    assert.notEqual(got, tip);
+    seedWorktree(dir);
+
+    assert.ok(!existsSync(join(dir, '.claude', 'skills', 'planning-methodology')));
+    const agents = join(dir, '.claude', 'agents');
+    assert.ok(!lstatSync(agents).isSymbolicLink(), 'agents/ is composed per file, not linked whole');
+    assert.ok(!existsSync(join(agents, 'planner-agent.md')));
+    assert.ok(!existsSync(join(agents, 'orchestrator-agent.md')));
+    for (const name of readdirSync(join(SKILLS_ROOT, 'agents'))) {
+      if (name === 'planner-agent.md' || name === 'orchestrator-agent.md') continue;
+      assert.equal(readlinkSync(join(agents, name)), join(SKILLS_ROOT, 'agents', name));
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('runForkPoint refuses a branch the base already contains, rather than returning its tip', () => {
-  // Once the run's MR lands, merge-base(branch, base) IS the branch tip, so the
-  // replay would build its worktree on top of the implementation it is meant to
-  // be re-planning from scratch. Wrong silently is the one outcome a
-  // measurement rig cannot have.
-  const { dir, tip } = repoWithBranch();
+test('a worktree composed with a whole-dir agents link is recomposed per file', () => {
+  // A worktree leased before agents were composed per file carries one symlink
+  // to the whole directory, and with it the agents that stop for approval.
+  const dir = repoWithCommittedClaude();
   try {
-    git(['update-ref', 'refs/remotes/origin/dev', tip], dir);
+    detachTrackedClaude(dir);
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    symlinkSync(join(SKILLS_ROOT, 'agents'), join(dir, '.claude', 'agents'));
 
-    assert.throws(
-      () => runForkPoint('oneshot/ticket-1-x', dir),
-      /contained in/,
-      'a landed branch must not silently yield its own tip',
-    );
+    ensureClaudeDir(dir);
+
+    assert.ok(!lstatSync(join(dir, '.claude', 'agents')).isSymbolicLink());
+    assert.ok(!existsSync(join(dir, '.claude', 'agents', 'planner-agent.md')));
+    assert.ok(existsSync(join(SKILLS_ROOT, 'agents', 'planner-agent.md')), 'the source is never touched');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-// ---------------------------------------- the replay declares what it can see
-
-/** A repo where the ticket's fix has LANDED on dev, as it has for any finished run. */
-function repoWithLandedFix(iid: number): { dir: string; base: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'oneshot-ak-'));
-  git(['init', '-q', '-b', 'dev'], dir);
-  git(['config', 'user.email', 'test@example.com'], dir);
-  git(['config', 'user.name', 'Test'], dir);
-  writeFileSync(join(dir, 'a.txt'), 'base\n');
-  git(['add', '-A'], dir);
-  git(['commit', '-qm', 'unrelated groundwork'], dir);
-  const base = git(['rev-parse', 'HEAD'], dir);
-  writeFileSync(join(dir, 'a.txt'), 'the fix\n');
-  git(['commit', '-qam', `fix: give the page a title (#${iid})`], dir);
-  git(['update-ref', 'refs/remotes/origin/dev', git(['rev-parse', 'HEAD'], dir)], dir);
-  return { dir, base };
-}
-
-test('a fix that landed after the base is reported as reachable', () => {
-  // The worktree is detached at `base`, but `git worktree add` shares the object
-  // store: `git log --all --grep` still reaches the fix. The run has to say so.
-  const { dir, base } = repoWithLandedFix(189);
+test('assertComposed is empty for a freshly composed worktree', () => {
+  const dir = repoWithCommittedClaude();
   try {
-    const got = answerKeyCommits(189, base, dir);
-    assert.equal(got.length, 1);
-    assert.match(got[0] ?? '', /give the page a title \(#189\)/);
+    seedWorktree(dir);
+    assert.deepEqual(assertComposed(dir), []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('a ticket with no commits naming it has no answer key to find', () => {
-  const { dir, base } = repoWithLandedFix(189);
+test('assertComposed names a skill the work repo put back, and a recompose clears it', () => {
+  // A session that runs `git checkout -- .` or `git stash` can lay the work
+  // repo's committed .claude back down; its stale copy then shadows ours.
+  const dir = repoWithCommittedClaude();
   try {
-    assert.deepEqual(answerKeyCommits(256, base, dir), []);
+    seedWorktree(dir);
+    rmSync(join(dir, '.claude', 'skills', 'frontend-accessibility'), { force: true });
+    git(['update-index', '--no-skip-worktree', '.claude/skills/frontend-accessibility/SKILL.md'], dir);
+    git(['checkout', '--', '.claude/skills/frontend-accessibility'], dir);
+    symlinkSync('/nonexistent/skill', join(dir, '.claude', 'skills', 'dangling'));
+
+    assert.deepEqual(assertComposed(dir).sort(), ['dangling', 'frontend-accessibility']);
+
+    detachTrackedClaude(dir);
+    ensureClaudeDir(dir);
+    assert.deepEqual(assertComposed(dir), []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('a source run\'s own unlanded branch is an answer key at its fork point', () => {
-  // The default path, with no --base: runForkPoint answers for a branch that
-  // never landed, and that branch still sits in the shared repo carrying the
-  // `(#77)` commits implement wrote. Reading "never landed" as "blind" is the
-  // mistake this pins.
-  const { dir, base } = repoWithLandedFix(189);
+test('assertComposed reports a worktree with no composed skills at all', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oneshot-wt-'));
   try {
-    git(['checkout', '-qb', 'oneshot/ticket-77-x', base], dir);
-    writeFileSync(join(dir, 'b.txt'), 'the run\'s own implementation\n');
-    git(['add', 'b.txt'], dir);
-    git(['commit', '-qm', 'fix: thing (#77)'], dir);
-    git(['checkout', '-q', 'dev'], dir);
-
-    const forkPoint = runForkPoint('oneshot/ticket-77-x', dir);
-    assert.equal(forkPoint, base);
-    const got = answerKeyCommits(77, forkPoint, dir);
-    assert.equal(got.length, 1);
-    assert.match(got[0] ?? '', /#77/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('history already inside the base is not an answer key', () => {
-  // A commit the phase is entitled to read: it is part of what it checked out.
-  const { dir } = repoWithLandedFix(189);
-  try {
-    const tip = git(['rev-parse', 'HEAD'], dir);
-    assert.deepEqual(answerKeyCommits(189, tip, dir), []);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('a repo git cannot walk is an error, not an empty answer key', () => {
-  // One dangling ref is enough to make `git log --all` exit 128. Returning []
-  // there wrote "nothing reachable" into meta.json for a check that never ran.
-  const { dir, base } = repoWithLandedFix(189);
-  try {
-    writeFileSync(join(dir, '.git', 'refs', 'heads', 'broken'), '0123456789abcdef0123456789abcdef01234567\n');
-
-    assert.throws(() => answerKeyCommits(189, base, dir), /bad object/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('a ticket number that is a prefix of another does not match it', () => {
-  // #18 must not be answered by #189's fix, or every low-numbered ticket reads
-  // as contaminated and the warning stops meaning anything.
-  const { dir, base } = repoWithLandedFix(189);
-  try {
-    assert.deepEqual(answerKeyCommits(18, base, dir), []);
+    assert.deepEqual(assertComposed(dir), ['.claude/skills']);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

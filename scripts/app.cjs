@@ -44,6 +44,33 @@ const { spawnSync } = require('child_process');
 const ONESHOT_HOME = process.env.ONESHOT_HOME || path.resolve(__dirname, '..');
 try { require('dotenv').config({ path: path.join(ONESHOT_HOME, '.env'), override: false }); } catch { /* optional */ }
 
+/**
+ * Credentials this script never uses and the processes it starts must never hold.
+ *
+ * The .env just loaded carries the desk's GitLab token and the managed test login, and
+ * a conductor's environment can carry Anthropic or Claude Code credentials. Django and
+ * webpack are long-lived, they run code the session edits, and on macOS a process of
+ * the same user can read another's environment (`ps eww <pid>`). So they are taken out
+ * of THIS process's environment, right here, before anything is spawned: every child —
+ * this file's own manage.py runs, and the runserver and webpack harness.cjs starts with
+ * `...process.env` — inherits the scrubbed copy. The harness's own login (run by a
+ * session, never by this script) reads ONESHOT_TEST_LOGIN from the session's env.
+ */
+const CREDENTIAL_KEYS = new Set([
+  'GITLAB_TOKEN', 'ONESHOT_GITLAB_TOKEN', 'ONELOOP_GITLAB_TOKEN', 'GITLAB_PERSONAL_ACCESS_TOKEN',
+  'ONESHOT_TEST_LOGIN', 'ONELOOP_TEST_LOGIN',
+]);
+const isCredentialKey = (k) => CREDENTIAL_KEYS.has(k) || k.startsWith('ANTHROPIC_') || k.startsWith('CLAUDE_CODE_');
+
+/** A copy of `env` without any credential key. */
+function scrubEnv(env) {
+  const out = {};
+  for (const [k, v] of Object.entries(env)) if (!isCredentialKey(k)) out[k] = v;
+  return out;
+}
+
+for (const k of Object.keys(process.env)) if (isCredentialKey(k)) delete process.env[k];
+
 const H = require(path.join(ONESHOT_HOME, 'skills/local-browser-verify/scripts/harness.cjs'));
 
 /* ------------------------------------------------------------------ config */
@@ -138,30 +165,35 @@ function checkoutError() {
     .map((s) => REPO.judgeOrigin(s, TARGET.repo.url, REPO.readOrigin(s.dir))));
 }
 
+/** config/project.json, read once; {} when it is missing or unreadable. */
+const PROJECT = (() => {
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(ONESHOT_HOME, 'config', 'project.json'), 'utf8'));
+    return c && typeof c === 'object' ? c : {};
+  } catch { return {}; }
+})();
+
 /**
  * The base branch MRs target, from config/project.json like the conductor reads it;
  * ONESHOT_BASE_BRANCH still overrides it for this script alone.
  */
-const BASE_BRANCH = cfg('ONESHOT_BASE_BRANCH', '') || (() => {
-  try {
-    const c = JSON.parse(fs.readFileSync(path.join(ONESHOT_HOME, 'config', 'project.json'), 'utf8'));
-    return (c && c.branches && c.branches.base) || 'dev';
-  } catch { return 'dev'; }
-})();
+const BASE_BRANCH = cfg('ONESHOT_BASE_BRANCH', '') || (PROJECT.branches && PROJECT.branches.base) || 'dev';
 
 /**
- * `staticfiles` is in this list for a reason worth keeping.
- *
- * local_settings.py ships DEBUG=False with ManifestStaticFilesStorage, so every
- * template that renders {% static %} — /admin/login/, which is the harness's own
- * readiness probe, and /home/ — raises `Missing staticfiles manifest entry` until
- * collectstatic has run. No worktree ever had it, so every fresh bring-up died as
- * E_DJANGO_DEAD after burning the full 90s Django budget. collectstatic takes 5s and
- * the output is 37MB of read-only files, so it is collected ONCE in the seed repo and
- * symlinked, exactly like venv and node_modules.
+ * What a worktree symlinks and copies from the seed: ONESHOT_SEED_LINKS / ONESHOT_SEED_COPIES,
+ * else config/project.json `seed` — per variable, the rule config.ts seedLinks()/seedCopies()
+ * apply. A session's env always carries both, resolved by the conductor (projectSessionEnv),
+ * so the file is only read when this script runs standalone. There is no list in this file:
+ * a project's lists are project data, and project.json is the one place they live.
  */
-const SEED_LINKS = list('ONESHOT_SEED_LINKS', 'venv,node_modules,staticfiles');
-const SEED_COPIES = list('ONESHOT_SEED_COPIES', 'hrdb/local_settings.py,frontend/src/constants/config.js');
+const seedList = (k, key) => {
+  const fromEnv = list(k, '');
+  if (fromEnv.length) return fromEnv;
+  const v = PROJECT.seed && PROJECT.seed[key];
+  return Array.isArray(v) ? v.map((s) => String(s).trim()).filter(Boolean) : [];
+};
+const SEED_LINKS = seedList('ONESHOT_SEED_LINKS', 'links');
+const SEED_COPIES = seedList('ONESHOT_SEED_COPIES', 'copies');
 
 /** Django ports we may lease. The webpack port is always base+1000 (harness convention). */
 const PORT_BASES = list('ONESHOT_APP_PORTS', '8010,8011,8012').map(Number).filter(Number.isInteger);
@@ -1151,7 +1183,7 @@ Environment: GITLAB_REPO_URL (the project; WORK_REPO and WT_ROOT default from it
  * to the TypeScript side: the claim that the two agree is only worth something checked.
  */
 module.exports = {
-  ensure, warm, discover, gc, down, resolveRef, checkoutError, cutFromOurClone,
+  ensure, warm, discover, gc, down, resolveRef, checkoutError, cutFromOurClone, scrubEnv,
   config: { name: TARGET.name, WORK_REPO, SEED_FROM, WT_ROOT, BASE_BRANCH, error: CONFIG_ERROR },
 };
 if (require.main === module) main();

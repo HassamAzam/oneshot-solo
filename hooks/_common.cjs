@@ -21,7 +21,7 @@
  * Every guard here is fail-open. The exception that used to live here —
  * deploy-guard, which failed CLOSED — went with the deploy phase; the runner
  * keeps the mechanism for whatever guard next needs it (FAIL_CLOSED in
- * src/conductor/hooks.ts).
+ * src/ticket/hooks.ts).
  */
 
 const fs = require('node:fs');
@@ -41,10 +41,11 @@ const ERROR_LOG = path.join(STATE, 'hook-errors.log');
 // ---------------------------------------------------------------- role gate
 
 /**
- * Hooks are installed user-wide in ~/.claude/settings.json, so they fire in
- * EVERY Claude Code session on this machine. Bailing immediately when the
- * phase env var is absent is what keeps Hassam's own interactive sessions
- * untouched — they pay one process spawn and exit.
+ * Solo hands these hooks to the ticket session in-process (src/ticket/hooks.ts),
+ * never through ~/.claude/settings.json, and that session always carries
+ * ONESHOT_PHASE=ticket. Bailing when it is absent keeps a hook inert anywhere
+ * else it runs — an interactive session someone wires it into, a script run
+ * by hand — at the cost of one process spawn.
  */
 function phase() { return process.env.ONESHOT_PHASE || ''; }
 function runId() { return process.env.ONESHOT_RUN_ID || ''; }
