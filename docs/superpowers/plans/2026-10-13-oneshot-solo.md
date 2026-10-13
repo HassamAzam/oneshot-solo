@@ -2557,6 +2557,131 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
+### Task 15: Start a ticket from the dashboard
+
+Added 2026-10-14 from the operator: "instead of running a command it should automatically initialize the session if I just write the ticket name in [the dashboard] and start to run [a] loop on it", and "I do need to know the current running ticket".
+
+**Files:**
+- Create: `src/lib/queue.ts`, `src/lib/queue.test.ts`
+- Modify: `scripts/serve.ts` (ticket box + `POST /run` + conductor status/start), `scripts/serve.test.ts`, `src/index.ts` (queued tickets dispatched before the scan), `src/ticket/scan.ts` only if the skip-reason text needs it, `scripts/status.ts` (queued rows), `README.md` (one section), `HANDOFF.md` (one paragraph)
+
+**Interfaces:**
+- Consumes: `STATE`, `PID_FILE` (config), `pidAlive` (journal), `allRuns` (telemetry), `runTicket(iid, { signal, force })` (run.ts).
+- Produces:
+  ```ts
+  // src/lib/queue.ts — the dashboard's hand-off to the conductor: one file per ticket under state/queue/
+  export const QUEUE_DIR: string;                         // join(STATE, 'queue')
+  export interface QueueEntry { iid: number; requestedAt: number; by: 'dashboard' | 'cli' }
+  export function enqueue(iid: number, by?: QueueEntry['by']): QueueEntry;   // idempotent: re-enqueue returns the existing entry
+  export function queued(): QueueEntry[];                 // oldest first
+  export function dequeue(): QueueEntry | null;           // removes and returns the oldest
+  export function remove(iid: number): boolean;
+  export function conductorLive(): { live: boolean; pid: number | null };    // PID_FILE + pidAlive
+  export function startConductor(): { started: boolean; pid?: number; why?: string };  // spawn `npm start` detached, log to state/conductor.log; refuses when live
+  ```
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/lib/queue.test.ts` (imports `./test-scratch-home.js` FIRST so STATE is a temp dir):
+
+```ts
+import './test-scratch-home.js';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { enqueue, queued, dequeue, remove, conductorLive, QUEUE_DIR } from './queue.js';
+import { PID_FILE } from './config.js';
+import { dirname } from 'node:path';
+
+test('enqueue is idempotent and queued() is oldest-first', () => {
+  const a = enqueue(412, 'dashboard'); const b = enqueue(99); const again = enqueue(412);
+  assert.equal(again.requestedAt, a.requestedAt);
+  assert.deepEqual(queued().map((q) => q.iid), [412, 99]);
+  assert.equal(b.by, 'cli');
+});
+test('dequeue removes the oldest; remove() deletes by iid', () => {
+  assert.equal(dequeue()!.iid, 412);
+  assert.equal(remove(99), true);
+  assert.equal(remove(99), false);
+  assert.equal(dequeue(), null);
+});
+test('a malformed queue file is skipped, not fatal', () => {
+  mkdirSync(QUEUE_DIR, { recursive: true });
+  writeFileSync(`${QUEUE_DIR}/notanumber.json`, '{');
+  assert.deepEqual(queued(), []);
+});
+test('conductorLive reads the pid file', () => {
+  mkdirSync(dirname(PID_FILE), { recursive: true });
+  writeFileSync(PID_FILE, `${process.pid}\n`);
+  assert.deepEqual(conductorLive(), { live: true, pid: process.pid });
+  writeFileSync(PID_FILE, '999999\n');
+  assert.equal(conductorLive().live, false);
+});
+```
+
+Add to `scripts/serve.test.ts`:
+
+```ts
+test('POST /run queues a valid iid and rejects the rest', async () => {
+  const { handleRun } = await import('./serve.js');
+  assert.deepEqual(await handleRun('iid=412'), { code: 303, location: '/?queued=412' });
+  assert.equal((await handleRun('iid=abc')).code, 400);
+  assert.equal((await handleRun('iid=-1')).code, 400);
+  assert.equal((await handleRun('')).code, 400);
+  const { queued } = await import('../src/lib/queue.js');
+  assert.deepEqual(queued().map((q) => q.iid), [412]);
+});
+test('the index shows queued tickets and the conductor state', async () => {
+  const { index } = await import('./serve.js');
+  const html = index();
+  assert.ok(html.includes('name="iid"'));                 // the ticket box
+  assert.ok(html.includes('#412') && html.includes('queued'));
+  assert.ok(/conductor (running|not running)/.test(html));
+});
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `npx tsx --test src/lib/queue.test.ts scripts/serve.test.ts`
+Expected: FAIL — `./queue.js` missing; `handleRun`/`index` not exported.
+
+- [ ] **Step 3: Implement `src/lib/queue.ts`**
+
+One JSON file per ticket at `state/queue/<iid>.json` holding `QueueEntry`; `queued()` lists `*.json`, parses each (skip on error), sorts by `requestedAt`; `enqueue` returns the existing entry when the file exists; `dequeue` = `queued()[0]` + `rmSync`. `conductorLive()` reads `PID_FILE` and uses `pidAlive`. `startConductor()`: if live → `{ started: false, why: 'already running (pid N)' }`; else `spawn(process.execPath, [join(ROOT, 'node_modules/tsx/dist/cli.mjs'), join(ROOT, 'src/index.ts')], { cwd: ROOT, detached: true, stdio: ['ignore', fd, fd], env: process.env })` with `fd = openSync(join(STATE, 'conductor.log'), 'a')`, then `child.unref()` and return `{ started: true, pid: child.pid }`. (No `npm` wrapper on purpose — oneshot learned a killed `npm` orphans its `tsx` child.)
+
+- [ ] **Step 4: Dashboard — the box, the queue, the conductor**
+
+`scripts/serve.ts`:
+- Export `index()` and `handleRun(body: string): Promise<{ code: number; location?: string; body?: string }>`: parse `iid` from a urlencoded body; a positive integer → `enqueue(iid, 'dashboard')` → `{ code: 303, location: '/?queued=<iid>' }`; anything else → `{ code: 400, body: 'iid must be a positive ticket number' }`.
+- Routes: `POST /run` (read the body, ≤ 1 KB, call `handleRun`, send 303 with `Location` or the 400 text); `POST /conductor/start` → `startConductor()` → 303 to `/`; everything else unchanged. Only `POST` mutates; `GET /run` is not a route.
+- `index()`: above the table, a one-line form `<form method="post" action="/run"><input name="iid" inputmode="numeric" pattern="[0-9]+" placeholder="ticket number" required> <button>Run</button></form>`; a line `conductor running (pid N)` or `conductor not running — <form method="post" action="/conductor/start"><button>Start it</button></form>`; a `queued` block listing `queued()` entries (`#412 · queued 3m ago · from dashboard`) when non-empty; the live run (the row whose summary has `live: true`) gets a `● running` marker in its status pill and is listed first; a `?queued=<iid>` query shows a one-line notice "#<iid> queued — the conductor picks it up on its next tick (within 60 s)".
+- Keep the server bound to 127.0.0.1 (it is); no auth is added — it is local-only, and `POST` from another origin is blocked by a same-origin check on the `Origin`/`Referer` header when present (reject if the host is not `127.0.0.1:<port>` or `localhost:<port>`).
+
+`scripts/status.ts`: print a `queued: #412, #99` line above the table when the queue is non-empty, and `conductor: running (pid N)` / `conductor: not running` as the first line.
+
+- [ ] **Step 5: Conductor — queued tickets go first**
+
+`src/index.ts` `tick()`: after the pause/quota checks and before `--ticket` handling, `const q = dequeue(); if (q) { log.phase(\`queued    #${q.iid} (from ${q.by})\`); running = runTicket(q.iid, { signal: aborter.signal, force: true }).…; return; }` — but only when no run is live (`running === null`); if one is live, leave the queue untouched and log `queued #N waits for the current run` once per tick. A queued ticket is dispatched exactly like `--ticket`: `force: true`, no `Loop` label required, the claim/resume/refuse rules unchanged. Add a focused test only if `tick` is already testable; otherwise cover the dispatch helper you extract (`export function takeQueued(): QueueEntry | null` that returns null when a run is live) with one unit test.
+
+- [ ] **Step 6: Docs**
+
+README: a short section *Starting a ticket from the dashboard* (type the number, press Run, the conductor must be running — the page says and can start it; the queue lives in `state/queue/`). HANDOFF: one paragraph under *Run it*.
+
+- [ ] **Step 7: Run everything**
+
+Run: `npm run check && npm test && bash scripts/verify-hooks.sh | tail -1`, then start the dashboard on a spare port, `curl -s -X POST -d iid=1 http://127.0.0.1:<port>/run -o /dev/null -w '%{http_code}\n'` → 303, `ls state/queue/` shows `1.json`, `curl -s http://127.0.0.1:<port>/ | grep -c queued` ≥ 1, then `rm state/queue/1.json`. Do not start the conductor.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/lib/queue.ts src/lib/queue.test.ts scripts/serve.ts scripts/serve.test.ts scripts/status.ts src/index.ts README.md HANDOFF.md
+git commit -q -m "feat(dashboard): queue a ticket from the dashboard; the conductor runs it next
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
 ## Plan self-review (done at authoring time)
 
 - **Spec coverage.** §3 flow → Tasks 9, 10, 11. §4.1 spawn → Task 9. §4.2 env → Task 9 (`sessionEnv`), Task 2 (`BASE_ENV`). §4.3 tool policy → Task 8 (`DENIED_TOOLS`). §4.4 prompt → Task 8. §4.5 schema → Task 8. §4.6 skills/context → Tasks 4, 7. §4.7 compaction/recovery → Tasks 8 (prompt), 11 (`attemptLoop`). §5.1 tick → Task 11. §5.2 claim/prepare → Tasks 4, 11. §5.3 outcome → Task 10. §5.4 finish/merge → Tasks 10, 11. §6 telemetry → Task 5. §7.1 `.env` → Task 1. §7.2 project.json → Tasks 1, 2. §7.3 setup/doctor/probe → Task 12. §7.4 deps → Task 1. §8 hooks → Task 6. §9 layout → Task 1 + the file structure above. §10 tests → each task's Step 1; hooks suite Task 6; probe Task 12; live checklist Task 13. §11 out of scope → nothing planned for it. §12 risks → the probe (Task 12), `ONESHOT_SUPERPOWERS_INJECT` fallback (Task 9), artifacts-on-disk (Tasks 7, 8), MR post-check (Task 10), `ONESHOT_PHASE` assertion (Task 2 test + Task 6 suite export).
