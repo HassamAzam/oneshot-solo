@@ -1,6 +1,6 @@
 ---
 name: ship-ticket
-description: Take one ticket from its URL to an open MR in a single session — bring the app up (reusing one that is already running), analyse, plan, implement, test it in a real browser, and raise the MR with evidence. Use when asked to "one-shot this ticket", "take this end to end", "set it up, fix it and raise the MR", "run the whole pipeline on this", or when handed a ticket/MR URL with no narrower instruction. Not for reviewing someone else's MR (erp-code-review).
+description: Take one ticket from its URL to an open MR in a single session — bring the app up (reusing one that is already running), analyse, plan, implement, test it in a real browser, and raise the MR with evidence. Use when Oneshot Solo hands you a ticket (the prompt says so), or when a person asks to "one-shot this ticket" / "take this end to end". Not for reviewing someone else's MR (erp-code-review).
 ---
 
 # Ship a ticket
@@ -13,9 +13,8 @@ the one that has historically eaten the session. Do it in one command and move o
 
 ```
 Ship <ticket-url> end to end: app up, analyse, plan, implement, test in the browser, MR.
-Ref: <branch|!MR|#PR>   (optional — omit to work on a fresh branch off dev)
-Stop and ask me only if: the ticket is ambiguous about expected behaviour, a test fails
-for a reason that is not this change, or the fix needs a schema migration.
+Nobody is watching. Record every assumption in the design file and the MR; set `blocked`
+in your final result only when the ticket cannot be built as written.
 ```
 
 Everything below is what that sentence means. Follow it in order.
@@ -87,17 +86,37 @@ Produce, in your own notes and in the MR description later:
   search patterns — the two spellings of every noun, the four kinds a name search misses,
   and resolving a hit to the definition containing it.
 
-## 2. Plan — confirm what you found, and keep it short
+## 2. Plan — superpowers, unattended
 
-You gathered the prior art in phase 1; here you confirm it. Open every candidate you
-intend to lean on rather than trusting the note you made, and search the residual your
-approach introduces — the unit you are adding, its mirror, the tests already covering the
-surface. The `change-scoping` skill carries that method, and where each finding lands.
+Planning is the superpowers plugin's job, not improvised. This skill runs inside Oneshot
+Solo's conductor, which starts the session unattended and disables `AskUserQuestion`
+(`src/ticket/types.ts` `DENIED_TOOLS`; design spec §4.3–4.4). The ticket, its comments and
+its attachments are the specification you plan against.
 
-The plan is a handful of steps naming real files and real symbols. If it needs a schema
-migration, or it touches any path listed in `$ONESHOT_HOME/config/risk-modules.json`, **stop and confirm
-before implementing** — those are the high-scrutiny paths and the ticket most worth pausing
-on is the one nobody remembered to label.
+1. `superpowers:brainstorming`. Answer its clarifying questions from the ticket and from
+   the code you read in phase 1. Write the understanding, the chosen approach and the
+   design to `$ONESHOT_ARTIFACTS/<iid>-design.md` (not into the repo). Where the ticket is
+   silent on a load-bearing choice, take the narrowest reading that satisfies the
+   acceptance criteria and list it under **Assumptions** in that file. In an unattended
+   run the written design file is the approval record: once it is written, move on to
+   the plan.
+2. `superpowers:writing-plans`. Write the plan to `$ONESHOT_ARTIFACTS/<iid>-plan.md`. Each
+   step names the files and symbols it touches. The execution method is fixed by the
+   conductor: execute the plan yourself with `superpowers:executing-plans`, in this
+   session. Pushing `$ONESHOT_BRANCH` and opening its merge request are the conductor's
+   standing authorization for this run; the guard hooks deny every other branch.
+3. Confirm the prior art from phase 1 by opening the files (`change-scoping` holds the
+   method). A schema migration or a change under a high-scrutiny path is not a reason to
+   stop — it is a reason to say so, prominently, in the design file and the MR.
+
+Do not invoke `superpowers:using-git-worktrees` (you are already in the leased worktree;
+its `npm install` step writes through a symlink into the shared clone) or
+`superpowers:finishing-a-development-branch` (section 5 replaces it).
+
+A question the ticket cannot answer becomes a recorded assumption; a ticket that cannot
+be built as written becomes a `blocked` result (see "The prompt"). After context
+compaction, re-read `$ONESHOT_ARTIFACTS/<iid>-plan.md` and `git log origin/dev..HEAD`
+before doing anything else.
 
 ## 3. Implement — through the agents, with the standards loaded
 
@@ -105,10 +124,8 @@ on is the one nobody remembered to label.
   migrations, `_<ModelName>` naming under `apps.get_model()`, and flake8 + pylint after
   every `.py` change.
 - React: the **frontend-agent**, with `react-frontend-standards`.
-- **Review their diffs for whole-file churn.** Neither agent is declared with `Edit` —
-  both are `Read, Write, Bash` — so every change they make is a full-file `Write`, and a
-  file they only partly changed can come back with unrelated lines rewritten. Read the
-  diff, not the summary, before moving on.
+- Both agents now carry Edit; prefer it to whole-file Write, and read the diff before
+  moving on.
 - Migrations: one per task, schema and data separated, reversible —
   `django-migration-standards` is not optional reading if you touch `migrations/`.
 - After the change lands, `node scripts/app.cjs ensure --ref <your-branch>` again: it is
@@ -140,14 +157,17 @@ If a case fails: fix it and re-run that case. If it fails for a reason that is n
 change, that is a **regression note in the MR**, not a case failure, and not yours to
 fix in this branch.
 
+Write the case list with its verdicts to $ONESHOT_ARTIFACTS/cases.json as
+[{id,title,verdict,note}] — the same list goes into your final structured result.
+
 ## 5. Raise the MR — with the evidence a reviewer needs to not check it out
 
 - Title and the closing-ticket link: the `mr-metadata` skill governs both. Get the
   ticket reference right; a reviewer who cannot find the ticket reads the diff blind.
 - Description: what changed and why, the acceptance criteria as a checklist with met /
   unmet, how it was verified (the case list and its verdicts), and the evidence.
-- Screenshots: before-and-after pairs plus the states no test reaches —
-  `ui-evidence-pack` covers how to attach them so they actually render in GitLab.
+- Screenshots saved under $ONESHOT_ARTIFACTS/ are served by the dashboard; attach the
+  before/after pairs to the MR with upload_markdown.
 
 ## Leave the app running
 
@@ -167,3 +187,4 @@ the machine is genuinely done, never as a courtesy.
   `frontend/src/constants/config.js` carry machine-local ports and are held with
   `--skip-worktree`; `app.cjs` re-applies and re-marks them after every checkout.
 - Do not push to `dev`, `stage`, `master` or `main`. Branch, then MR.
+- Do not write the design or plan into the repository; they belong in $ONESHOT_ARTIFACTS.
