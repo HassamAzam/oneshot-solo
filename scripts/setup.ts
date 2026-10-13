@@ -2,24 +2,29 @@
  * `npm run setup` — interactive first-run wizard.
  *
  * `npm start` calls this automatically when there is no .env, so a fresh clone
- * is `npm install && npm start` and nothing else. GITLAB_REPO_URL comes first and
- * has no default — it is the one fact the machine cannot guess, and the prompt
- * repeats until it gets a valid URL. After it, every prompt either defaults
- * (the paths derive from the URL) or can be skipped with Enter. GITLAB_TOKEN
- * defaults only when ~/.claude.json already holds one; skipped, it leaves the
- * .env.example placeholder, and boot refuses until a token is filled in.
+ * is `npm install && npm start` and nothing else. Four questions:
+ *
+ *   GITLAB_REPO_URL     no default — the one fact the machine cannot guess; the
+ *                       prompt repeats until it gets a valid URL
+ *   GITLAB_TOKEN        defaults to the one ~/.claude.json already holds
+ *   WORK_REPO           defaults to an existing clone, else ~/Documents/<name>
+ *   ONESHOT_TEST_LOGIN  Enter to skip
+ *
+ * Everything else derives from the URL (WT_ROOT) or has a default in
+ * .env.example and config/project.json. The answer for WORK_REPO is checked:
+ * that it exists, and that its origin is the project the URL names.
  *
  * Secrets are written to .env at mode 600 and never echoed back. A reconfigure
  * copies the .env it started from to .env.bak-<timestamp> (also mode 600)
  * before writing, so a wrong answer costs nothing that cannot be copied back.
  */
 import { createInterface } from 'node:readline/promises';
-import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { backupFile, legacyLines, pinPath, readKey, removeLegacySelectors, setKey } from '../src/lib/envfile.js';
-import { EXAMPLE_URL, defaultWorkRepo, defaultWtRoot, parseRepoUrl, type GitlabRepo } from '../src/lib/repourl.cjs';
+import { originFinding } from '../src/lib/repocheck.js';
+import { EXAMPLE_URL, defaultWorkRepo, defaultWtRoot, expandPath, parseRepoUrl, type GitlabRepo } from '../src/lib/repourl.cjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const ENV = join(ROOT, '.env');
@@ -54,17 +59,14 @@ function detectRepo(name: string): string {
 }
 
 async function main(): Promise<void> {
-  console.log(`\n${B}Oneshot setup${X}\n`);
+  console.log(`\n${B}Oneshot Solo setup${X}\n`);
 
   const reconfigure = existsSync(ENV);
   if (reconfigure) {
     const overwrite = await ask('.env already exists. Reconfigure it? (y/N)', { default: 'N' });
     if (!/^y/i.test(overwrite)) { console.log('  Keeping it.\n'); rl.close(); return; }
-  } else {
-    copyFileSync(EXAMPLE, ENV);
   }
-
-  let body = readFileSync(ENV, 'utf8');
+  let body = readFileSync(reconfigure ? ENV : EXAMPLE, 'utf8');
 
   console.log(`${B}GitLab${X}`);
   // First, because everything else is derived from it: the API, the token page,
@@ -97,89 +99,54 @@ async function main(): Promise<void> {
   if (found) console.log(`  ${G}Found a GitLab token in ~/.claude.json — press Enter to reuse it.${X}`);
   const glToken = await ask('GITLAB_TOKEN', {
     default: found, secret: true,
-    hint: found ? '' : 'Project access token, scope api. Settings → Access Tokens.',
+    hint: found ? '' : 'Personal access token, scope api — or Enter, then `npm run token:set` to keep it outside the repo.',
   });
   body = setKey(body, 'GITLAB_TOKEN', glToken);
 
-  console.log(`\n${B}Repositories${X}`);
+  console.log(`\n${B}Your clone${X}`);
   const derived = defaultWorkRepo(repo.name);
   const work = await ask('WORK_REPO', {
     default: detectRepo(repo.name) || derived,
-    hint: `Your clone of ${repo.project}. Worktrees are cut from it; its origin must be that project.`,
+    hint: `Your clone of ${repo.project}. Worktrees are cut from it and seeded from it; its origin must be that project.`,
   });
-  const ctx = await ask('CONTEXT_REPO', {
-    default: detectRepo('erp') || '~/Documents/erp',
-    hint: 'Read-only reference for prior art and conventions.',
-  });
+  // Pinned only when the answer differs from what GITLAB_REPO_URL derives, and
+  // an old line REMOVED when it does not: a reconfigure starts from the
+  // existing .env, where a WORK_REPO from the previous project would otherwise
+  // outrank the answer just given.
+  body = pinPath(body, { envName: 'WORK_REPO', name: repo.name, answer: work, derived, root: ROOT });
+  const workDir = expandPath(work, ROOT);
+  if (!existsSync(workDir)) {
+    console.log(`  ${Y}${workDir} does not exist yet — clone it before \`npm start\`:  git clone <clone url> ${workDir}${X}`);
+  } else {
+    const judged = originFinding('WORK_REPO', workDir, { GITLAB_REPO_URL: repo.url });
+    if (judged && judged.level !== 'pass') console.log(`  ${Y}${judged.label}: ${judged.detail}${X}`);
+    else console.log(`  ${G}${workDir} is a clone of ${repo.project}.${X}`);
+  }
+
+  // Not asked: worktrees go to ~/Documents/<name>-wt, one directory per project
+  // since they are named by ticket iid. A WT_ROOT line left from another
+  // project would outrank that, so a reconfigure removes it.
   const derivedWt = defaultWtRoot(repo.name);
   const oldWt = readKey(body, 'WT_ROOT');
-  const wt = await ask('WT_ROOT', {
-    default: derivedWt,
-    hint: `Where per-ticket worktrees go — one directory per project, since they are named by ticket iid.`
-      + (oldWt && oldWt !== derivedWt ? ` .env currently says ${oldWt}.` : ''),
-  });
-  // Pinned only when an answer differs from what GITLAB_REPO_URL derives, and
-  // an old line REMOVED when it does not: a reconfigure starts from the
-  // existing .env, where a WORK_REPO or WT_ROOT from the previous project would
-  // otherwise outrank the answer just given.
-  body = pinPath(body, { envName: 'WORK_REPO', name: repo.name, answer: work, derived, root: ROOT });
-  body = pinPath(body, { envName: 'WT_ROOT', name: repo.name, answer: wt, derived: derivedWt, root: ROOT });
-  body = setKey(body, 'CONTEXT_REPO', ctx);
-  // Skills/agents/rules are vendored into this repo's context/, so leave
-  // ONESHOT_SKILLS_ROOT empty to use that self-contained default. Set it only
-  // to override with a live .claude (e.g. `${ctx}/.claude`).
-  body = setKey(body, 'ONESHOT_SKILLS_ROOT', '');
-  // The seed is the installed clone worktrees borrow node_modules and venv
-  // from, and scripts/app.cjs also fetches refs from it — so it has to be a
-  // clone of the same project, which the work repo is by definition.
-  body = pinPath(body, { envName: 'ONESHOT_SEED_FROM', name: repo.name, answer: work, derived: '', root: ROOT });
-
-  console.log(`\n${B}Slack${X} ${D}(optional — Enter to skip, status stays on the console)${X}`);
-  const slackToken = await ask('SLACK_BOT_TOKEN', {
-    secret: true,
-    hint: 'xoxb- token. Scopes: chat:write, chat:write.public, files:write, channels:history.',
-  });
-  if (slackToken) {
-    body = setKey(body, 'SLACK_BOT_TOKEN', slackToken);
-    body = setKey(body, 'ONESHOT_CHANNEL',
-      await ask('ONESHOT_CHANNEL', { hint: 'Channel id (C0…), from View channel details.' }));
-    body = setKey(body, 'ONESHOT_OWNER_SLACK_ID',
-      await ask('ONESHOT_OWNER_SLACK_ID', { hint: 'Your user id (U…) — the @mention on BLOCKED.' }));
+  body = pinPath(body, { envName: 'WT_ROOT', name: repo.name, answer: derivedWt, derived: derivedWt, root: ROOT });
+  if (oldWt && expandPath(oldWt, ROOT) !== expandPath(derivedWt, ROOT)) {
+    console.log(`  ${D}WT_ROOT=${oldWt} removed — worktrees go to ${derivedWt}, derived from the URL.${X}`);
   }
 
-  console.log(`\n${B}Session tracking${X} ${D}(optional — Langfuse)${X}`);
-  const lfPub = await ask('LANGFUSE_PUBLIC_KEY', { secret: true, hint: 'pk-lf-… Enter to skip.' });
-  if (lfPub) {
-    body = setKey(body, 'LANGFUSE_PUBLIC_KEY', lfPub);
-    body = setKey(body, 'LANGFUSE_SECRET_KEY', await ask('LANGFUSE_SECRET_KEY', { secret: true }));
-    const host = await ask('LANGFUSE_BASE_URL', {
-      default: 'http://localhost:3000',
-      hint: 'http://localhost:3000 self-hosted, or https://cloud.langfuse.com',
-    });
-    body = setKey(body, 'LANGFUSE_BASE_URL', host);
-    if (!/localhost|127\.0\.0\.1/.test(host)) {
-      console.log(`  ${Y}That endpoint is remote. Spans carry file paths and command arguments`);
-      console.log(`  from your codebase — structural metadata, not source or prompts.${X}`);
-      const ok = await ask('Send them off this machine? (y/N)', { default: 'N' });
-      body = setKey(body, 'ONESHOT_OTEL_ALLOW_REMOTE', /^y/i.test(ok) ? '1' : '');
-    }
-  }
+  console.log(`\n${B}Browser verification${X} ${D}(optional — Enter to skip)${X}`);
+  const login = await ask('ONESHOT_TEST_LOGIN', {
+    default: readKey(body, 'ONESHOT_TEST_LOGIN') ?? '', secret: true,
+    hint: 'email:password of the managed test account the session logs in with.',
+  });
+  body = setKey(body, 'ONESHOT_TEST_LOGIN', login);
 
+  // Written once, at the end: a wizard abandoned half-way leaves no .env, so
+  // the next `npm start` asks again instead of booting on a template.
   const backup = reconfigure ? backupFile(ENV) : '';
-  writeFileSync(ENV, body);
+  writeFileSync(ENV, body, { mode: 0o600 });
   chmodSync(ENV, 0o600);
   console.log(`\n${G}Wrote .env (mode 600, gitignored).${X}`);
   if (backup) console.log(`  ${D}The previous .env is saved as ${backup} (mode 600) — delete it once this one works.${X}`);
-
-  console.log(`\n${B}Guardrail hooks${X}`);
-  const install = await ask('Install them into ~/.claude/settings.json? (Y/n)', { default: 'Y' });
-  if (/^y/i.test(install)) {
-    try {
-      execFileSync('node', [join(ROOT, 'scripts/install-hooks.cjs')], { stdio: 'inherit' });
-    } catch {
-      console.log(`  ${Y}Hook install failed — run 'npm run hooks:install' by hand.${X}`);
-    }
-  }
 
   rl.close();
   console.log(`\n${G}Done.${X} Next: ${B}npm run doctor${X} to check everything, then ${B}npm start${X}.\n`);

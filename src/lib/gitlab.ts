@@ -411,9 +411,14 @@ export interface Label { name: string }
  * on the board, or never created simply never matches. Nothing raises: a swap
  * writes a label the board does not show. This is the one call that can turn
  * that into a sentence.
+ *
+ * One page of 100. A project can define more than that (arbisoft/erp has over
+ * 300, group labels included), so a caller asking about particular names
+ * passes `search` — a substring match, which the caller then checks exactly.
  */
-export function listLabels(): Promise<GitlabResult<Label[]>> {
-  return call<Label[]>('GET', `/projects/${projectId()}/labels?per_page=100`);
+export function listLabels(search?: string): Promise<GitlabResult<Label[]>> {
+  const q = search ? `&search=${encodeURIComponent(search)}` : '';
+  return call<Label[]>('GET', `/projects/${projectId()}/labels?per_page=100${q}`);
 }
 
 export interface Branch { name: string; protected: boolean; commit: { id: string } }
