@@ -2682,6 +2682,47 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
+### Task 16: Residuals from the final re-review
+
+Added 2026-10-14 from the scoped re-review of the final fix wave (`.superpowers/sdd/2026-10-13-oneshot-solo/final-rereview-report.md`). Four small corrections and one documentation line; runs after Task 15 in the main checkout.
+
+**Files:**
+- Modify: `src/ticket/finish.ts` (+ `finish.test.ts`), `src/ticket/session.ts` (+ `session.test.ts`), `src/ticket/prompt.ts` (one sentence; + `prompt.test.ts`), `src/ticket/run.ts` (+ `run.test.ts`), `hooks/secret-guard.cjs` (+ `scripts/verify-hooks.sh` cases), `README.md` (one sentence)
+
+**Interfaces:** none new. `leaseFor` keeps its injected `LeaseDeps`; add `mrState?: (mrIid: number) => Promise<'merged' | 'opened' | 'closed' | 'unknown'>` to it (default: `getMergeRequest` → `data.state`, `'unknown'` on failure).
+
+- [ ] **Step 1: Failing tests first**
+
+1. `finish.test.ts`: with deps whose `editIssueLabels` throws once, `finish()` on a done outcome leaves the journal status NOT terminal (still `running`) and `merged`/`mrIid` recorded; a second `finish()` with a blocked outcome then labels `Needs Human` (so the catch-all path works). With deps that succeed, the journal ends `done` as before.
+2. `session.test.ts`: `sessionMcpServers(iid, { projectId: 123 })` (or however the id reaches it today) sets `GITLAB_ALLOWED_PROJECT_IDS` to exactly `'123'` and `GITLAB_PROJECT_ID` to `'123'`; without an id, neither is set and no multi-entry allowlist exists.
+3. `prompt.test.ts`: the prompt contains the sentence naming `$ONESHOT_PROJECT_ID` as the `project_id` to pass to every GitLab tool.
+4. `run.test.ts`: (a) a `done` + `merged:true` journal → the new lease's branch is `<branch>-<6>` even when `deleteLocalBranch` succeeds; (b) a `done` + `merged:false` journal whose `mrIid` the injected `mrState` reports `'merged'` takes the same path; (c) `mrState` `'opened'` keeps today's re-attach behaviour.
+5. `verify-hooks.sh`: `expect_deny "Grep rooted at ONESHOT_HOME" secret-guard.cjs '{"tool_name":"Grep","tool_input":{"pattern":"GITLAB_TOKEN","path":"'"$ONESHOT_HOME"'"}}'`; `expect_deny "Grep rooted above ONESHOT_HOME"` with `path` = `$(dirname "$ONESHOT_HOME")`; `expect_allow "Grep inside the worktree"` with `path` = `$ONESHOT_WORKTREE`; `expect_allow "Grep with no path (cwd = worktree)"` with no `path` key.
+
+Run them → FAIL.
+
+- [ ] **Step 2: Implement**
+
+- `finish.ts`: in the `done` and `blocked` paths, perform the GitLab calls first, then `updateJournal(..., { status })`; keep `mrIid/mrUrl/merged/blockedWhy` writes early so the dashboard sees them even if a later call throws. The early-return guard for an already-terminal journal stays.
+- `session.ts` `sessionMcpServers`: `GITLAB_ALLOWED_PROJECT_IDS = String(projectId)` only when known; `GITLAB_PROJECT_ID` the same; never the path.
+- `prompt.ts`: in MR_CONTRACT (or the Method block), one sentence: "Every GitLab tool call passes `project_id: $ONESHOT_PROJECT_ID` (the numeric id the conductor resolved; the server refuses other projects)."
+- `run.ts` `leaseFor`: `const wasMerged = existing.merged === true || (existing.mrIid ? (await deps.mrState(existing.mrIid)) === 'merged' : false)`; when `wasMerged`: reap, `deleteLocalBranch` (best effort), then lease under `suffixed(branch, runId)` always.
+- `secret-guard.cjs`: for `Grep` (and `Glob` if it is matched), resolve `tool_input.path` (absent → allow; the session's cwd is the worktree); deny when the resolved directory equals `ONESHOT_HOME` or is an ancestor of `ONESHOT_HOME/.env`'s directory; message: "search inside your worktree — the harness root holds .env".
+- `README.md` (Config or Running section): "The app bring-up gets the same allowlisted environment as the session plus `app.cjs`'s own `.env` load; shell-only variables (for example `PG*`) do not reach Django — put them in `.env`."
+
+- [ ] **Step 3: Gates and commit**
+
+`npm run check && npm test && bash scripts/verify-hooks.sh | tail -1 && npm run doctor -- --no-probe | tail -1`, then:
+
+```bash
+git add src/ticket/finish.ts src/ticket/finish.test.ts src/ticket/session.ts src/ticket/session.test.ts src/ticket/prompt.ts src/ticket/prompt.test.ts src/ticket/run.ts src/ticket/run.test.ts hooks/secret-guard.cjs scripts/verify-hooks.sh README.md
+git commit -q -m "fix(ticket,guards): journal status after GitLab; single-entry project allowlist; merged re-runs take a fresh branch; no grep at the harness root
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
 ## Plan self-review (done at authoring time)
 
 - **Spec coverage.** §3 flow → Tasks 9, 10, 11. §4.1 spawn → Task 9. §4.2 env → Task 9 (`sessionEnv`), Task 2 (`BASE_ENV`). §4.3 tool policy → Task 8 (`DENIED_TOOLS`). §4.4 prompt → Task 8. §4.5 schema → Task 8. §4.6 skills/context → Tasks 4, 7. §4.7 compaction/recovery → Tasks 8 (prompt), 11 (`attemptLoop`). §5.1 tick → Task 11. §5.2 claim/prepare → Tasks 4, 11. §5.3 outcome → Task 10. §5.4 finish/merge → Tasks 10, 11. §6 telemetry → Task 5. §7.1 `.env` → Task 1. §7.2 project.json → Tasks 1, 2. §7.3 setup/doctor/probe → Task 12. §7.4 deps → Task 1. §8 hooks → Task 6. §9 layout → Task 1 + the file structure above. §10 tests → each task's Step 1; hooks suite Task 6; probe Task 12; live checklist Task 13. §11 out of scope → nothing planned for it. §12 risks → the probe (Task 12), `ONESHOT_SUPERPOWERS_INJECT` fallback (Task 9), artifacts-on-disk (Tasks 7, 8), MR post-check (Task 10), `ONESHOT_PHASE` assertion (Task 2 test + Task 6 suite export).
