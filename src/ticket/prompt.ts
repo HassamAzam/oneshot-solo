@@ -716,10 +716,11 @@ not read this ticket.
     is not this change. Copy each \`regressions\` entry into it word for word: that list is
     checked against this description by its text before anything merges.
 
-Attach a screenshot with \`mcp__gitlab__upload_markdown\` and paste the markdown it returns.
-That tool refuses an absolute path, a \`..\` segment and a symlink — it reads \`file_path\`
-relative to the directory the GitLab server runs in — so when an upload is refused, name the
-file's path under \`${c.artifactsDir}\` in the description instead of spending turns on it.
+Attach a screenshot by uploading it with \`mcp__gitlab__upload_markdown\`, giving \`file_path\`
+RELATIVE to \`$ONESHOT_ARTIFACTS\` (the GitLab server runs with that directory as its cwd) —
+e.g. \`screens/01-before.png\` — and paste the markdown it returns. The tool refuses an
+absolute path, a \`..\` segment and a symlink, so when an upload is refused, name the file's
+path under \`${c.artifactsDir}\` in the description instead of spending turns on it.
 \`create_merge_request_note\` and \`upload_markdown\` sit outside the GitLab server's default
 toolset: if either is missing from your tools, \`mcp__gitlab__discover_tools\` with category
 \`merge_requests\` or \`users\` adds it.
