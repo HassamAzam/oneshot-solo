@@ -30,8 +30,9 @@
  * it, so neither condition can arise.
  *
  * `--no-verify` is deliberately ALLOWED: the husky pre-commit hook in these
- * repos is broken locally and aborts every commit. Lint is enforced as a phase
- * gate instead, which is where it can actually be reported.
+ * repos is broken locally and aborts every commit. Lint is enforced instead by
+ * the project pack's PostToolUse lints on every write (hooks/packs/erp/py-lint,
+ * js-standards), which is where it can actually be reported.
  */
 const path = require('node:path');
 const C = require(path.join(__dirname, '_common.cjs'));

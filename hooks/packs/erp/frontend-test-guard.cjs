@@ -62,8 +62,8 @@
  * escape valve for a test your change made obsolete.
  *
  * Fails OPEN, like every guard outside the FAIL_CLOSED set in
- * src/conductor/hooks.ts. Writing a doomed test wastes part of a lap; a guard
- * that wedges the phase costs the whole run.
+ * src/ticket/hooks.ts. Writing a doomed test wastes part of an attempt; a guard
+ * that wedges the session costs the whole run.
  */
 const path = require('node:path');
 const C = require(path.join(__dirname, '..', '..', '_common.cjs'));
@@ -85,8 +85,8 @@ const TEST_DIR = '__tests__';
 /**
  * The tools that author a file.
  *
- * src/conductor/hooks.ts already registers this guard behind the same matcher,
- * so in the pipeline nothing else arrives. It is re-checked here because the
+ * The erp pack.json already registers this guard behind the same matcher, so
+ * in a run nothing else arrives. It is re-checked here because the
  * promise in the header — that reading and searching a test is untouched — has
  * to hold for the script itself, not only for one call site that is currently
  * configured correctly.

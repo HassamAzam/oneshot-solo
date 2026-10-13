@@ -32,7 +32,9 @@ That form brings the app up for *your* checkout and never moves its ref, so it i
 at any point — including after `implement` has left uncommitted work in the tree. If the
 conductor's bring-up is still compiling you join it; you never restart it.
 
-**Working by hand, outside a run**, name what you want instead:
+**Working by hand, outside a run** — never inside a Oneshot run: the conductor owns the
+checkout, and `--ref` from a leased worktree either moves a ref under your uncommitted work or
+cold-starts a second app on other code — name what you want instead:
 
 ```
 node scripts/app.cjs ensure --ref <branch|!MR|#PR|sha>
@@ -60,10 +62,11 @@ All three print the same `app-env.json` — `baseUrl`, `bePort`, `fePort`, `work
   into their day's work.
 - If it returns a named code (`E_NO_PORTS`, `E_SEED_MISSING`, `E_DJANGO_DEAD`,
   `E_WEBPACK_DEAD`, `E_MIGRATE_FAILED`, …), **report the code and its hint**. Do not
-  improvise a repair. `node scripts/app.cjs gc --kill` reaps orphaned servers and is
+  improvise a repair. `node $ONESHOT_HOME/scripts/app.cjs gc --kill` reaps orphaned servers and is
   the fix for `E_NO_PORTS` specifically.
-- Log in with `node skills/local-browser-verify/scripts/harness.cjs smoke` before you
-  believe any of it. It is 12 seconds and it is the only proof the app actually renders.
+- Log in with `node $ONESHOT_HOME/skills/local-browser-verify/scripts/harness.cjs smoke`
+  before you believe any of it. It is 12 seconds and it is the only proof the app actually
+  renders.
 
 Now the fixed cost is paid. Nothing after this point has a floor.
 
@@ -128,10 +131,11 @@ before doing anything else.
   moving on.
 - Migrations: one per task, schema and data separated, reversible —
   `django-migration-standards` is not optional reading if you touch `migrations/`.
-- After the change lands, `node scripts/app.cjs ensure --ref <your-branch>` again: it is
-  a Django restart and an incremental rebuild, not a bring-up. Django runs `--noreload`,
-  so **Python edits are not live until that restart**. This is the single most common
-  way a session tests the code it wrote ten minutes ago.
+- After a Python change, restart Django before you test against it:
+  `node $ONESHOT_HOME/scripts/app.cjs down --worktree $ONESHOT_WORKTREE`, then
+  `node $ONESHOT_HOME/scripts/app.cjs ensure` (no arguments). Django runs `--noreload`, so
+  **Python edits are not live until that restart**. This is the single most common way a
+  session tests the code it wrote ten minutes ago. Never `--ref` inside a run.
 
 ## 4. Test — write the cases from the criteria, then execute them in the browser
 

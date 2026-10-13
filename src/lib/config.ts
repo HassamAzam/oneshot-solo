@@ -193,10 +193,11 @@ export const DRY_RUN = envFlag('DRY_RUN');
  * The GitLab username this desk claims ASSIGNED tickets as.
  *
  * Not configuration. It is whoever this desk's GitLab token belongs to, resolved
- * once at boot by asking GitLab (src/lib/identity.ts), so the account that claims
- * a ticket is always the account that will comment, push and merge on it. A
- * function rather than a const because a const would be captured at module
- * load, which is before boot has asked.
+ * by asking GitLab — at boot, or by a later tick when GitLab did not answer then
+ * (src/lib/identity.ts) — so the account that claims a ticket is always the
+ * account that will comment, push and merge on it. A function rather than a
+ * const because a const would be captured at module load, which is before boot
+ * has asked.
  */
 export function gitlabUsername(): string { return deskUsername(); }
 

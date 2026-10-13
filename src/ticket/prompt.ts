@@ -74,6 +74,10 @@ function documentsBlock(t: Ticket): string {
  * psycopg2-before-ssl import-order trap means a session that writes a password
  * can poison its own login and then burn its budget concluding the app is
  * broken. The operator pins the hash with a preloaded shell; the session only USES it.
+ *
+ * The prompt names the variable, never the value: the session env carries it
+ * (sessionEnv), and a prompt lands in the CLI's own transcript under
+ * ~/.claude/projects and is replayed on every resume.
  */
 function testLoginBlock(): string {
   const raw = envOr('ONESHOT_TEST_LOGIN');
@@ -84,11 +88,12 @@ function testLoginBlock(): string {
 and after ANY password write immediately prove it with a curl to the login endpoint. If that
 check fails once, STOP touching passwords and report — iterating here is the trap.`;
   }
-  return `Log in with EXACTLY these managed credentials — they are pinned outside your session
-and verified against the running server before you started:
-
-    email:    ${email}
-    password: ${password}
+  return `Log in with EXACTLY the managed credentials — they are pinned outside your session
+and verified against the running server before you started. They are in your environment as
+\`$ONESHOT_TEST_LOGIN\`, in the form \`email:password\` (split on the FIRST colon; a password may
+contain one). The harness reads it from there; a Playwright script of yours reads
+\`process.env.ONESHOT_TEST_LOGIN\`. Never print its value — not with echo, not in a log line,
+a file, a screenshot caption or the MR: everything you print lands in a transcript.
 
 NEVER reset, change, or re-pin this password — a corrupted-shell write is precisely how the
 trap above poisons login. If a case genuinely needs a DIFFERENT user (another role), you may
@@ -563,8 +568,7 @@ ${testLoginBlock()}
 If this change adds migrations, run them before the first request against the app.
 
 Log in through the REAL login form with the credentials in the seeded settings. Do not stub
-authentication and do not bypass the login screen; \`/admin\` is available if you need to reset
-a password or find an email.
+authentication and do not bypass the login screen.
 
 Drive the browser with Playwright, from Bash, with \`node\` — there is no browser tool in this
 session. Resolve \`playwright\` through the \`node_modules\` your worktree already has and

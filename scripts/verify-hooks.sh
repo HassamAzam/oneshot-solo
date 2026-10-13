@@ -205,14 +205,14 @@ expect_allow "Oneshot's own unit test (this repo has no frontend/)" \
 expect_allow "Read of a Jest test — this guard is writes only" \
     frontend-test-guard.cjs '{"tool_name":"Read","tool_input":{"file_path":"'"$ONESHOT_WORKTREE"'/frontend/src/components/profile/__tests__/AddRelative.test.js"}}'
 
-# The guard is phase-independent: verify writes Playwright, implement writes
-# code, and neither may author a Jest test. Pinning a non-implement phase stops
-# someone narrowing this to `implement` and reopening it for every other phase.
+# The guard never reads the phase's value — a Solo session's is always `ticket`,
+# so any branch on it would be dead code. Running it under another value pins
+# that, so nobody reintroduces a phase gate that lets some session write a Jest test.
 SAVED_PHASE="$ONESHOT_PHASE"
 export ONESHOT_PHASE="verify"
-expect_deny  "a Jest test from verify, not just implement" \
+expect_deny  "a Jest test whatever ONESHOT_PHASE says" \
     frontend-test-guard.cjs "$(write_payload "$ONESHOT_WORKTREE/frontend/src/components/leaves/__tests__/LeaveForm.test.js")"
-expect_allow "verify's Playwright driver"  frontend-test-guard.cjs "$(write_payload "$ONESHOT_WORKTREE/.verify-scratch/run-cases.js")"
+expect_allow "a Playwright driver"          frontend-test-guard.cjs "$(write_payload "$ONESHOT_WORKTREE/.verify-scratch/run-cases.js")"
 export ONESHOT_PHASE="$SAVED_PHASE"
 
 # A path that reaches frontend/src through a symlink is still frontend/src, and

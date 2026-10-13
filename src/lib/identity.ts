@@ -124,8 +124,9 @@ export async function tokenIdentity(): Promise<TokenIdentity | null> {
  * The desk's username, resolved once and remembered.
  *
  * The assignee gate runs on every scan and cannot make a network call each time,
- * so index.ts resolves this at boot (via checkIdentity) and the watcher reads the
- * cached answer. Empty before boot has resolved it, which is the same "skip every
+ * so index.ts resolves this at boot (via checkIdentity) — and, when GitLab did
+ * not answer then, on each tick until it does (recheckIdentity) — and the scan
+ * reads the cached answer. Empty until then, which is the same "skip every
  * assigned ticket" behaviour as an unidentified desk — correct, because a desk
  * that does not yet know who it is must not claim anybody's work.
  */

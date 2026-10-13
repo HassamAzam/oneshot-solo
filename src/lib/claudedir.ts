@@ -1,20 +1,19 @@
 /**
- * The `.claude` directory a phase session can actually read.
+ * The `.claude` directory the ticket session can actually read.
  *
  * Sessions are spawned with `settingSources: ['project']`, so the only place a
  * skill, agent or rule can come from is a `.claude` directory in the session's
- * cwd. Worktree phases had one — seed() symlinked the whole of the context
- * repo's `.claude` into the worktree — but conductor-cwd phases (recall, qa,
- * demo, document, memorize) run in the Oneshot repo root, which had no
- * `.claude` at all. Every skill their prompts named silently failed to resolve:
- * the recorded run-5 transcripts show the recall session listing eight built-in
- * slash commands and not one project skill, while the worktree sessions listed
- * forty-two. Nothing errored. The phase did the work from the prompt alone and
- * the loss was invisible from outside.
+ * cwd: the leased worktree (and the conductor root, which boot composes the
+ * same way). A skill the prompt names that is not there silently fails to
+ * resolve — oneshot's recorded run-5 transcripts show a session with no
+ * composed `.claude` listing eight built-in slash commands and not one project
+ * skill, while sessions that had one listed forty-two. Nothing errored. The
+ * session did the work from the prompt alone and the loss was invisible from
+ * outside.
  *
- * A whole-dir symlink cannot fix that, because the pipeline skills
- * (local-browser-verify, ui-evidence-pack, self-remediation) describe THIS
- * system and live in THIS repo — a fresh
+ * A whole-dir symlink of the context repo's `.claude` cannot do it, because the
+ * pipeline skills (ship-ticket, local-browser-verify, …) describe THIS system
+ * and live in THIS repo — a fresh
  * clone has to carry them, and writing them into the context repo would make
  * Oneshot's own method something you have to remember to install next to it. So
  * `.claude` is composed instead: a real directory whose `skills/` holds one

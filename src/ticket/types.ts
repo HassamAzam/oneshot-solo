@@ -15,7 +15,7 @@ export const RESULT_SCHEMA: Record<string, unknown> = {
   required: ['summary'],
   properties: {
     summary: { type: 'string', description: 'What was built and verified, 3-8 sentences, for the ticket note.' },
-    blocked: { type: ['string', 'null'], description: 'ONLY when no retry would help: what stopped the work and what would unblock it. Omit or null otherwise.' },
+    blocked: { type: ['string', 'null'], description: 'Only for a ticket that cannot be built as written: say what is missing and what would unblock it. Omit or null otherwise.' },
     branch: { type: 'string' },
     mrIid: { type: 'integer' },
     mrUrl: { type: 'string' },

@@ -40,9 +40,9 @@ C.bailIfNotOneshot();
 
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit']);
 /**
- * Just under the conductor's 60s GUARD_TIMEOUT_MS for this hook, so the
- * linters are what gets killed and the kill is logged here, rather than the
- * whole hook dying with nothing said about which tool was slow.
+ * Just under this hook's 60 s `timeoutMs` in pack.json, so the linters are what
+ * gets killed and the kill is logged here, rather than the whole hook dying
+ * with nothing said about which tool was slow.
  */
 const TOOL_TIMEOUT_MS = 55_000;
 const MAX_LINES = 25;
