@@ -53,6 +53,13 @@ Label a ticket `Loop` and the next tick (≤ 60 s) claims it, unless it carries 
 was blocked less than 30 minutes ago. One conductor per checkout: a second `npm start`
 refuses while `state/conductor.pid` is alive.
 
+Or with no command at all: `npm run dashboard`, type the ticket number into the box at the
+top and press **Run**. That queues it (`state/queue/<iid>.json`), and the conductor's next tick
+runs it exactly as `--ticket` would — no `Loop` label needed — before anything on the board,
+one at a time, never while a run is live. The page says whether the conductor is running and
+starts it when it is not (detached, output in `state/conductor.log`; stop it with
+`kill $(cat state/conductor.pid)`). The run in flight is listed first, marked `● running`.
+
 ## Read it
 
 ```sh
@@ -125,3 +132,17 @@ to `.env`: the session then appends the plugin's `using-superpowers` intro to it
 prompt, which is all the hook injects. Re-run `npm run doctor`; it reports the fallback as
 on. If the plugin did not load at all, set `ONESHOT_SUPERPOWERS_PATH` to the plugin dir
 (the one holding `skills/brainstorming/SKILL.md`).
+
+## Status (2026-10-14)
+
+- **Tests:** `npm test` 273/273; `bash scripts/verify-hooks.sh` 170 hook cases, 0 failed;
+  `npm run check` clean.
+- **Doctor on the operator desk:** 0 failed, 2 warnings — the GitLab token lives in `.env`
+  (`npm run token:set` moves it out), and the protected branch `main` named in
+  `config/project.json` is absent from the project.
+- **Live probe:** the superpowers plugin loaded, its skills appear namespaced as
+  `superpowers:*`, its SessionStart hook fired, on Claude Code CLI 2.1.296.
+- **No ticket has run live yet.** The first live run is the ticket number typed into the
+  dashboard, or `npm start -- --ticket <small iid>`, with `merge.mode: "manual"` until one
+  dashboard page has been read end to end (*The first live run*, above).
+- **Rotate the GitLab token** if the implementation transcripts are ever shared.

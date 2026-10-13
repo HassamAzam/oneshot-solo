@@ -2,10 +2,11 @@
  * Oneshot Solo entry point. `npm start`.
  *
  * The conductor is code, never a model: it boots, then ticks. A tick probes
- * GitLab, honours the pause and quota switches, scans the entry label, and
- * dispatches ONE ticket when no run is live (spec §5.1). The run is not
- * awaited — the loop keeps ticking and logging while it works — and there is
- * only ever one, because one desk runs one ticket on one port.
+ * GitLab, honours the pause and quota switches, takes a ticket the operator
+ * queued from the dashboard (state/queue/, src/lib/queue.ts) or else scans the
+ * entry label, and dispatches ONE ticket when no run is live (spec §5.1). The
+ * run is not awaited — the loop keeps ticking and logging while it works — and
+ * there is only ever one, because one desk runs one ticket on one port.
  *
  *   npm start                     watch the board, one ticket at a time
  *   npm start -- --once           one tick; waits for the run it dispatched
@@ -26,9 +27,10 @@ import { checkIdentity, describeIdentity, recheckIdentity } from './lib/identity
 import { checkoutFindings, identityFindings, relaxRepoChecks, repoCheckOverrideNotice } from './lib/repocheck.js';
 import { ensureClaudeDir } from './lib/claudedir.js';
 import { pidAlive } from './lib/journal.js';
-import { netState, nextProbeDelayMs, probe } from './lib/reachability.js';
+import { isReachable, netState, nextProbeDelayMs, probe } from './lib/reachability.js';
 import { quotaParked } from './lib/quota.js';
 import { log } from './lib/log.js';
+import { queued, takeQueued } from './lib/queue.js';
 import { describe, scan } from './ticket/scan.js';
 import { runTicket } from './ticket/run.js';
 
@@ -171,17 +173,39 @@ async function tick(): Promise<void> {
     return;
   }
 
+  // A ticket typed into the dashboard goes before the board, and runs exactly
+  // as `--ticket` would: the operator named it, so no Loop label is needed and
+  // the blocked cooldown does not apply. Never while a run is live — it waits —
+  // and not while GitLab is unreachable, when the scan holds too: taken off the
+  // queue then, it would fail to read the ticket and be gone. Below `--ticket`,
+  // so a queued ticket can never displace the named one.
+  if (!stopping && isReachable()) {
+    const q = takeQueued(running !== null);
+    if (q) {
+      log.phase(`queued    #${q.iid} (from ${q.by})`);
+      dispatch(q.iid, true);
+      return;
+    }
+    const next = queued()[0];
+    if (next) log.info(`queued #${next.iid} waits for the current run`);
+  }
+
   const result = await scan();
   log.info(`tick  ${describe(result)}${runningIid !== null ? `  (in flight: #${runningIid})` : ''}`);
   for (const s of result.skipped) log.info(`skip       #${s.iid}  ${s.why}`);
   if (running || stopping || !result.candidates.length) return;
+  dispatch(result.candidates[0]!.iid, false);
+}
 
-  // Dispatched, not awaited: the loop keeps ticking while the run works.
-  const c = result.candidates[0]!;
-  runningIid = c.iid;
-  running = runTicket(c.iid, { signal: aborter.signal })
-    .then((status) => log.info(`#${c.iid} ended ${status}`))
-    .catch((err: Error) => log.error(`#${c.iid} run threw`, { error: err.message }))
+/**
+ * Start a run, dispatched and not awaited: the loop keeps ticking while it
+ * works. `force` is the operator's say-so (a queued ticket), as for `--ticket`.
+ */
+function dispatch(iid: number, force: boolean): void {
+  runningIid = iid;
+  running = runTicket(iid, { signal: aborter.signal, force })
+    .then((status) => log.info(`#${iid} ended ${status}`))
+    .catch((err: Error) => log.error(`#${iid} run threw`, { error: err.message }))
     .finally(() => { running = null; runningIid = null; });
 }
 

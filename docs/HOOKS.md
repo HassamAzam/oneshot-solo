@@ -31,8 +31,9 @@ exactly one implementation of each policy. Nothing is installed into `~/.claude/
 and sessions load `settingSources: ['project']` only.
 
 - **Minimal child env.** A guard runs with `guardEnv(env)`: `PATH`, `HOME`, `CONTEXT_REPO` and
-  every `ONESHOT_*`, nothing else. The GitLab token, `ANTHROPIC_*` and `CLAUDE_CODE_USE_*` never
-  reach a guard.
+  every `ONESHOT_*` except the two that are credentials, `ONESHOT_GITLAB_TOKEN` and
+  `ONESHOT_TEST_LOGIN` — nothing else. So the GitLab token (in any spelling), the managed test
+  login, `ANTHROPIC_*` and `CLAUDE_CODE_USE_*` never reach a guard; no guard reads any of them.
 - **Bounded and fail-open.** A guard that times out (15 s by default; a pack entry carries its
   own), fails to spawn, exits non-zero with no output or prints non-JSON resolves to `{}` — allow
   — and is logged as `guard <name> did not run`. A broken guard must never wedge a run.

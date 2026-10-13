@@ -90,6 +90,9 @@ test('sessionEnv carries the identity, write scopes, artifacts and labels, and n
   process.env.GITLAB_TOKEN = 'glpat-secret'; process.env.ANTHROPIC_API_KEY = 'sk-no';
   const env = sessionEnv({ iid: 1, runId: 'r-1', lap: 0, ticket: { iid: 1, title: 't', description: '', labels: ['Loop', 'Bug'], notes: [], documents: [], externalDocs: [] }, worktree: '/wt', branch: 'oneshot/ticket-1-t', port: 8000, previousAttempt: false });
   assert.equal(env.ONESHOT_PHASE, 'ticket');
+  // harness.cjs and app.cjs read ONESHOT_IID; without it their files land in state/runs/adhoc.
+  assert.equal(env.ONESHOT_IID, '1');
+  assert.equal(env.ONESHOT_IID, env.ONESHOT_TICKET);
   assert.equal(env.ONESHOT_TICKET_LABELS, 'Loop,Bug');
   assert.ok(env.ONESHOT_WRITE_SCOPES!.startsWith('/wt:'));
   assert.ok(env.ONESHOT_ARTIFACTS!.endsWith('/state/runs/1/artifacts'));
