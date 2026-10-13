@@ -2398,6 +2398,165 @@ Then append a dated *Status* section to `HANDOFF.md` stating: tests/hook counts,
 
 ---
 
+### Task 14: Guards from the usage report — no `git stash`, no whole-file rewrites
+
+Added 2026-10-13 from the operator's Claude Code Insights report (`~/.claude/usage-data/report-2026-10-13-133914.html`, "Where Things Go Wrong"): a leftover `git stash` reverted commits and was blamed on a concurrent process; an agent pass rewrote `actionTypes.js` and net-deleted ~1,177 lines to change one line. Both are mechanical to prevent.
+
+**Files:**
+- Modify: `hooks/git-guard.cjs` (add `checkStash` beside `checkBranchDelete`; call it from the same per-segment loop that calls `checkPush`/`checkBranchDelete`)
+- Create: `hooks/churn-guard.cjs`
+- Modify: `src/ticket/hooks.ts` (register `churn-guard.cjs` as a core PreToolUse guard on `^Write$`, after `write-scope.cjs`), `src/ticket/hooks.test.ts` (the core-guard assertion gains it)
+- Modify: `scripts/verify-hooks.sh` (cases below), `docs/HOOKS.md` (two rows), `skills/ship-ticket/SKILL.md` (two **Do not** bullets)
+
+**Interfaces:**
+- Consumes: `hooks/_common.cjs` (`readInput`, `deny`, `allow`, `event`, `bailIfNotOneshot`), the `ONESHOT_WORKTREE` env the session carries.
+- Produces: nothing new for other tasks; `hooksFor()` keeps its signature.
+
+- [ ] **Step 1: Add the suite cases first (they fail)**
+
+Append to `scripts/verify-hooks.sh` before the summary:
+
+```bash
+echo "git-guard (stash)"
+expect_deny  "git stash"                 git-guard.cjs "$(bash_payload 'git stash')"
+expect_deny  "git stash push -m wip"     git-guard.cjs "$(bash_payload 'git stash push -m wip')"
+expect_deny  "git stash pop"             git-guard.cjs "$(bash_payload 'git stash pop')"
+expect_deny  "chained stash"             git-guard.cjs "$(bash_payload 'git add -A && git stash')"
+expect_allow "git stash list (read-only)" git-guard.cjs "$(bash_payload 'git stash list')"
+expect_allow "a commit mentioning stash" git-guard.cjs "$(bash_payload 'git commit -m "remove stash helper"')"
+
+echo "churn-guard"
+CHURN_DIR="$ONESHOT_WORKTREE/churn"; mkdir -p "$CHURN_DIR"
+seq 1 100 | sed 's/^/line /' > "$CHURN_DIR/big.js"
+churn_payload() { printf '{"tool_name":"Write","tool_input":{"file_path":"%s","content":%s}}' "$1" "$(printf '%s' "$2" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.stringify(s)))')"; }
+expect_deny  "Write shrinks a 100-line file to 3 lines" churn-guard.cjs "$(churn_payload "$CHURN_DIR/big.js" $'a\nb\nc\n')"
+expect_allow "Write keeps most of the file"             churn-guard.cjs "$(churn_payload "$CHURN_DIR/big.js" "$(seq 1 80 | sed 's/^/line /')")"
+expect_allow "Write to a new file"                      churn-guard.cjs "$(churn_payload "$CHURN_DIR/new.js" $'a\nb\n')"
+expect_allow "Write shrinks a tiny file"                churn-guard.cjs "$(churn_payload "$CHURN_DIR/small.js" 'x')"
+printf 'one\ntwo\nthree\n' > "$CHURN_DIR/small.js"
+expect_allow "Edit is never judged"                     churn-guard.cjs '{"tool_name":"Edit","tool_input":{"file_path":"'"$CHURN_DIR"'/big.js","old_string":"line 1","new_string":"x"}}'
+```
+
+Run: `bash scripts/verify-hooks.sh | tail -3` → the new deny cases FAIL (git-guard allows stash; churn-guard.cjs is missing).
+
+- [ ] **Step 2: `checkStash` in git-guard**
+
+```js
+/**
+ * `git stash` is banned in a leased worktree. A stash is state the conductor
+ * cannot see: in ticket #8878 a leftover stash/pop sequence reverted commits
+ * and the session blamed a concurrent process. Setting work aside is a WIP
+ * commit on the leased branch; reading the stash list stays allowed.
+ */
+function checkStash(t) {
+  if (t[0] !== 'git' || t[1] !== 'stash') return;
+  const sub = t[2] || 'push';
+  if (sub === 'list' || sub === 'show') return;
+  C.event('denied_stash', { cmd: t.join(' ') });
+  C.deny(
+    `Denied: \`git stash\` is not available in a leased worktree (${sub}).\n` +
+    'A stash is state nothing else can see, and a leftover one has silently reverted a ' +
+    'run\'s commits before. To set work aside, commit it as WIP on the leased branch ' +
+    '(`git commit -m "wip: …"`) and amend or squash later.',
+  );
+}
+```
+
+`t` is the token array the existing per-segment loop already builds for `checkPush` (read how `checkBranchDelete(t, cfg)` is invoked and call `checkStash(t)` right after it).
+
+- [ ] **Step 3: `hooks/churn-guard.cjs`**
+
+```js
+#!/usr/bin/env node
+'use strict';
+/**
+ * PreToolUse on Write: a Write that replaces an existing file with far less
+ * than it had is almost always a partial change done as a whole-file rewrite
+ * — the Claude Code Insights report for this desk counted one pass that
+ * net-deleted ~1,177 lines of actionTypes.js to change a single line, and
+ * two sessions redoing that work. Edit is the tool for partial changes; this
+ * guard says so at the moment it matters, before the file is gone.
+ *
+ * Rule: deny when the target exists with >= MIN_LINES lines and the new
+ * content has fewer than KEEP of them. Below MIN_LINES, or for a new file,
+ * or for Edit/NotebookEdit, it has no opinion.
+ */
+const fs = require('node:fs');
+const path = require('node:path');
+const C = require(path.join(__dirname, '_common.cjs'));
+
+C.bailIfNotOneshot();
+
+const MIN_LINES = 40;
+const KEEP = 0.5;
+
+function lines(s) { return s.length ? s.split('\n').length : 0; }
+
+try {
+  const data = C.readInput();
+  if (data.tool_name === 'Write') {
+    const input = data.tool_input || {};
+    const file = typeof input.file_path === 'string' ? input.file_path : '';
+    const content = typeof input.content === 'string' ? input.content : null;
+    if (file && content !== null && fs.existsSync(file) && fs.statSync(file).isFile()) {
+      const before = lines(fs.readFileSync(file, 'utf8'));
+      const after = lines(content);
+      if (before >= MIN_LINES && after < before * KEEP) {
+        C.event('denied_churn', { file, before, after });
+        C.deny(
+          `Denied: this Write would replace ${file} (${before} lines) with ${after} lines.\n` +
+          'A whole-file Write that drops most of a file is how a one-line change once deleted ' +
+          '~1,177 lines. Use Edit for a partial change (old_string → new_string), or, if the ' +
+          'file really should shrink this much, delete the lines with Edit in steps so each ' +
+          'removal is reviewable in the diff.',
+        );
+      }
+    }
+  }
+} catch (err) {
+  C.logFailure('churn-guard', err);
+}
+
+C.allow();
+```
+
+Check `_common.cjs` for the exact helper names (`readInput`, `deny`, `allow`, `event`, `logFailure`, `bailIfNotOneshot`) and use them as the other guards do.
+
+- [ ] **Step 4: Register it; document it; tell the session**
+
+`src/ticket/hooks.ts`: in the core `PreToolUse` list add `{ matcher: '^Write$', hooks: [core('churn-guard.cjs')], timeout: 15 }` immediately after the `write-scope.cjs` entry. `src/ticket/hooks.test.ts`: the core-guard test asserts `pre.includes('^Write$')`.
+
+`docs/HOOKS.md`: add rows for `churn-guard.cjs` (core, PreToolUse Write, the rule above) and for git-guard's new `git stash` denial.
+
+`skills/ship-ticket/SKILL.md`, under **Do not**, append:
+
+```
+- Do not `git stash` in the worktree (the guard denies it). Set work aside with a WIP commit
+  on your branch; a leftover stash once reverted a run's commits and looked like a race.
+- Do not rewrite a whole file to change a few lines. Use Edit; the guard denies a Write
+  that drops most of an existing file. After each edit, `git diff --stat` — deletions far
+  larger than intended mean restore the file and re-apply only the change you meant.
+```
+
+- [ ] **Step 5: Run everything**
+
+Run: `bash scripts/verify-hooks.sh | tail -3 && npx tsx --test src/ticket/hooks.test.ts && node --check hooks/churn-guard.cjs && npm run check`
+Expected: suite `failed 0` (145 cases), hooks tests pass, check clean except scripts/doctor.ts if Task 12 has not landed.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add hooks/git-guard.cjs hooks/churn-guard.cjs src/ticket/hooks.ts src/ticket/hooks.test.ts scripts/verify-hooks.sh docs/HOOKS.md skills/ship-ticket/SKILL.md
+git commit -q -m "feat(hooks): deny git stash in the worktree; churn-guard denies whole-file rewrites
+
+From the Claude Code Insights report: a leftover stash reverted a run's
+commits, and a one-line change once net-deleted ~1,177 lines.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
 ## Plan self-review (done at authoring time)
 
 - **Spec coverage.** §3 flow → Tasks 9, 10, 11. §4.1 spawn → Task 9. §4.2 env → Task 9 (`sessionEnv`), Task 2 (`BASE_ENV`). §4.3 tool policy → Task 8 (`DENIED_TOOLS`). §4.4 prompt → Task 8. §4.5 schema → Task 8. §4.6 skills/context → Tasks 4, 7. §4.7 compaction/recovery → Tasks 8 (prompt), 11 (`attemptLoop`). §5.1 tick → Task 11. §5.2 claim/prepare → Tasks 4, 11. §5.3 outcome → Task 10. §5.4 finish/merge → Tasks 10, 11. §6 telemetry → Task 5. §7.1 `.env` → Task 1. §7.2 project.json → Tasks 1, 2. §7.3 setup/doctor/probe → Task 12. §7.4 deps → Task 1. §8 hooks → Task 6. §9 layout → Task 1 + the file structure above. §10 tests → each task's Step 1; hooks suite Task 6; probe Task 12; live checklist Task 13. §11 out of scope → nothing planned for it. §12 risks → the probe (Task 12), `ONESHOT_SUPERPOWERS_INJECT` fallback (Task 9), artifacts-on-disk (Tasks 7, 8), MR post-check (Task 10), `ONESHOT_PHASE` assertion (Task 2 test + Task 6 suite export).
