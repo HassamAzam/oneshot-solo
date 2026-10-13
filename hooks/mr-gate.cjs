@@ -11,7 +11,9 @@
  *      GitLab server holds reaches every project the operator can; nothing
  *      but this rule and the server's own allowlist stops a note or an MR
  *      landing on another one. With neither variable set the call is allowed
- *      and logged as `mr_gate_no_project` — the server allowlist still holds.
+ *      and logged as `mr_gate_no_project`; the server's allowlist (the numeric
+ *      id alone, src/ticket/session.ts) holds only when the conductor resolved
+ *      that id.
  *   2. A create goes from ONESHOT_BRANCH into the base (config/project.json
  *      branches.base), and an update that sends a target sends the base. An MR
  *      from any other branch is not this run's MR: the conductor never finds

@@ -39,6 +39,11 @@
  * (the tracked list of variable names) is a copy of the secrets; a work repo's
  * .env and .env.* belong to the app the session is there to run, and blocking
  * them would break bringing that app up.
+ *
+ * One directory rule: a Grep tool search rooted at ONESHOT_HOME, or at any
+ * directory above it, walks .env along with everything else and prints its
+ * matching lines, whatever the glob. Such a search is denied; a Grep with no
+ * path runs in the session's cwd, the worktree, and is left alone.
  */
 const os = require('node:os');
 const path = require('node:path');
@@ -47,6 +52,8 @@ const C = require(path.join(__dirname, '_common.cjs'));
 C.bailIfNotOneshot();
 
 const READ_TOOLS = new Set(['Read', 'NotebookRead', 'Grep']);
+/** Tools that search a directory tree. Glob is not routed here (src/ticket/hooks.ts READ_OR_BASH), and it lists names, not contents. */
+const SEARCH_TOOLS = new Set(['Grep']);
 const ENV_FILE = path.join(C.ONESHOT, '.env');
 const HOME = os.homedir();
 
@@ -127,6 +134,18 @@ try {
     if (file) {
       C.event('denied_secret_read', { tool, target });
       C.deny(denial(file));
+    }
+  }
+
+  // A search rooted at the harness root, or above it, reaches .env whatever its glob says.
+  if (SEARCH_TOOLS.has(tool) && typeof input.path === 'string' && input.path) {
+    const cwd = data.cwd || process.env.ONESHOT_WORKTREE || C.ONESHOT;
+    const target = expand(input.path);
+    const root = path.isAbsolute(target) ? target : path.resolve(cwd, target);
+    if (C.isInside(C.ONESHOT, root)) {
+      C.event('denied_secret_search', { tool, root });
+      C.deny(`Denied: ${tool} rooted at ${root}; search inside your worktree — the harness root holds .env, ` +
+        'and every line a search there matches lands in a transcript that outlives the run.');
     }
   }
 

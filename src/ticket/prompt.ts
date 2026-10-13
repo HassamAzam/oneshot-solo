@@ -673,6 +673,9 @@ const MR_CONTRACT = (c: PromptContext): string => {
 
 Push this run's branch and open the merge request.
 
+Every GitLab tool call passes \`project_id: $ONESHOT_PROJECT_ID\` (the numeric id the conductor resolved; the server refuses other projects).
+If \`$ONESHOT_PROJECT_ID\` is empty (GitLab could not be asked when the run started), pass \`$ONESHOT_PROJECT_PATH\` instead.
+
 1. LOOK FOR AN EXISTING MR for source branch \`${c.branch}\` before you create anything. This
    run may be a resumption, and a second MR for one branch is a mess a human has to clean up.
    If one exists, you are updating it, not opening another: report ITS iid and url.

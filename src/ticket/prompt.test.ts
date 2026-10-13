@@ -64,3 +64,10 @@ test('the verify hazards survive the lift: shared Postgres, psycopg2-before-ssl,
     }
   }
 });
+
+test('the MR contract names $ONESHOT_PROJECT_ID as the project_id for every GitLab tool call', () => {
+  const p = ticketPrompt(ticket as never, ctx);
+  assert.ok(p.includes('Every GitLab tool call passes `project_id: $ONESHOT_PROJECT_ID` (the numeric id the conductor resolved; the server refuses other projects).'));
+  // An unresolved id leaves the server with no default project; the path is what mr-gate accepts then.
+  assert.ok(p.includes('If `$ONESHOT_PROJECT_ID` is empty (GitLab could not be asked when the run started), pass `$ONESHOT_PROJECT_PATH` instead.'));
+});

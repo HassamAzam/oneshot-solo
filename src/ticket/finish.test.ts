@@ -138,3 +138,35 @@ test('finish is a no-op once the journal is terminal: a second call on a done ru
     assert.equal(readJournal(12)!.status, status);
   }
 });
+
+test('a GitLab call that throws mid-finish leaves the journal running with the MR on record, so the catch-all finish still labels Needs Human', async () => {
+  fresh(13);
+  let throwsLeft = 1;
+  const { calls, d } = deps({
+    editIssueLabels: async (_iid: number, p: unknown) => {
+      if (throwsLeft-- > 0) throw new Error('label swap blew up');
+      calls.push(['labels', p]); return { ok: true, kind: 'ok', status: 200, data: null };
+    },
+  });
+  await assert.rejects(finish(13, 'r-1', { kind: 'done', mr, result: ok, problems: [] }, d as never), /label swap blew up/);
+  const mid = readJournal(13)!;
+  assert.equal(mid.status, 'running', 'not terminal: GitLab was never told how the run ended');
+  assert.equal(mid.merged, true); assert.equal(mid.mrIid, 9); assert.equal(mid.mrUrl, 'https://g/!9');
+  assert.equal(mid.stoppedAt, undefined);
+
+  // run.ts's catch-all: finish again as blocked.
+  await finish(13, 'r-1', { kind: 'blocked', why: 'the conductor failed mid-run: label swap blew up' }, d as never);
+  assert.deepEqual(calls.filter(([k]) => k === 'labels').map(([, p]) => p), [{ remove: ['Loop', 'In Review'], add: ['Needs Human'] }]);
+  assert.match(String(calls.filter(([k]) => k === 'note').at(-1)![1]), /Oneshot stopped: \*\*the conductor failed mid-run/);
+  const j = readJournal(13)!;
+  assert.equal(j.status, 'blocked'); assert.equal(j.merged, true); assert.equal(j.mrIid, 9); assert.ok(j.stoppedAt);
+});
+
+test('a blocked finish whose stop note throws records why, but stays non-terminal until GitLab has been told', async () => {
+  fresh(14);
+  const { d } = deps({ addIssueNote: async () => { throw new Error('note blew up'); } });
+  await assert.rejects(finish(14, 'r-1', { kind: 'blocked', why: 'needs a schema decision' }, d as never), /note blew up/);
+  const j = readJournal(14)!;
+  assert.equal(j.status, 'running');
+  assert.equal(j.blockedWhy, 'needs a schema decision');
+});

@@ -127,15 +127,24 @@ test('sessionMcpServers: one `gitlab` server through the shim, BASE_ENV undernea
   assert.deepEqual(gl.env.GITLAB_TOOLS!.split(','), ['create_merge_request_note', 'upload_markdown']);
   assert.equal(gl.env.GITLAB_PERMISSION_MODE, 'modify');
   assert.equal(gl.env.GITLAB_DENIED_TOOLS_REGEX, SERVER_DENIED_TOOLS_REGEX);
-  // No numeric id known: the server is still held to the project by its path.
-  assert.equal(gl.env.GITLAB_ALLOWED_PROJECT_IDS, 'acme/erp');
-  assert.equal(gl.env.GITLAB_PROJECT_ID, 'acme/erp');
   assert.equal(gl.env.ENABLE_STRICT_PROJECT_SCOPE, 'true');
-  const scoped = (sessionMcpServers(7, 304) as Record<string, Stdio>).gitlab!;
-  assert.equal(scoped.env.GITLAB_ALLOWED_PROJECT_IDS, '304,acme/erp');
-  assert.equal(scoped.env.GITLAB_PROJECT_ID, '304');
   const s = sessionEnv({ iid: 7, runId: 'r-7', lap: 0, ticket: { iid: 7, title: 't', description: '', labels: [], notes: [], documents: [], externalDocs: [] }, worktree: '/wt', branch: 'b', port: 8000, previousAttempt: false });
   assert.ok(!Object.values(s).includes('glpat-mcp-only'), 'the GitLab token never reaches the session env');
+});
+
+test('sessionMcpServers holds the server to the numeric project id alone: one allowlist entry, never the path', () => {
+  process.env.ONESHOT_GITLAB_TOKEN = 'glpat-test';
+  const scoped = (sessionMcpServers(7, 123) as Record<string, Stdio>).gitlab!;
+  // 2.2.4's getEffectiveProjectId defaults a call that omits project_id only from a ONE-entry allowlist.
+  assert.equal(scoped.env.GITLAB_ALLOWED_PROJECT_IDS, '123');
+  assert.equal(scoped.env.GITLAB_PROJECT_ID, '123');
+  const unknown = (sessionMcpServers(7) as Record<string, Stdio>).gitlab!;
+  assert.equal(unknown.env.GITLAB_ALLOWED_PROJECT_IDS, undefined);
+  assert.equal(unknown.env.GITLAB_PROJECT_ID, undefined);
+  for (const env of [scoped.env, unknown.env]) {
+    assert.ok(!(env.GITLAB_ALLOWED_PROJECT_IDS ?? '').includes(','), 'no multi-entry allowlist');
+    assert.ok(!Object.values(env).includes('acme/erp'), 'the path is never a server project value');
+  }
 });
 
 test('sessionEnv names the project for mr-gate: its path always, its numeric id when the conductor resolved one', () => {
@@ -158,11 +167,16 @@ test('sessionEnv names the project for mr-gate: its path always, its numeric id 
 test('the gitlab shim runs the server from ONESHOT_ARTIFACTS, so upload_markdown takes a relative path — on this project only', async () => {
   const artifacts = join(mkdtempSync(join(tmpdir(), 'solo-mcp-')), 'artifacts');   // not created: the shim must create it
   const uploads: string[] = [];
+  const requests: string[] = [];
   const gitlab = createServer((req, res) => {
     const chunks: Buffer[] = [];
+    requests.push(`${req.method} ${req.url}`);
     req.on('data', (c: Buffer) => chunks.push(c));
     req.on('end', () => {
-      if (req.method === 'POST' && req.url === '/api/v4/projects/1/uploads') {
+      if (req.method === 'GET' && req.url?.startsWith('/api/v4/projects/1/merge_requests')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('[]');
+      } else if (req.method === 'POST' && req.url === '/api/v4/projects/1/uploads') {
         uploads.push(Buffer.concat(chunks).toString('latin1'));
         res.writeHead(201, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ id: 1, alt: '01-before', url: '/uploads/x/01-before.png', full_path: '/acme/erp/uploads/x/01-before.png', markdown: '![01-before](/uploads/x/01-before.png)' }));
@@ -220,6 +234,12 @@ test('the gitlab shim runs the server from ONESHOT_ARTIFACTS, so upload_markdown
     assert.equal((other.result as { isError?: boolean }).isError, true);
     assert.match(JSON.stringify(other.result), /not in the allowed project list/);
     assert.equal(uploads.length, 1);
+
+    // A call that omits project_id defaults to the one allowed project instead of failing "Multiple projects allowed".
+    const mrs = await call('tools/call', { name: 'list_merge_requests', arguments: {} });
+    assert.equal(mrs.error, undefined, JSON.stringify(mrs.error));
+    assert.notEqual((mrs.result as { isError?: boolean }).isError, true, JSON.stringify(mrs.result));
+    assert.ok(requests.some((r) => r.startsWith('GET /api/v4/projects/1/merge_requests')), requests.join('\n'));
   } finally {
     child.kill();
     gitlab.close();

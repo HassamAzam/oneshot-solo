@@ -80,11 +80,14 @@ function positiveIid(raw: string | null): number | null {
 
 /**
  * `POST /run` with a urlencoded `iid`: queue that ticket for the conductor and
- * send the browser back to the index, which says it is queued.
+ * send the browser back to the index, which says it is queued. A ticket whose
+ * run is live right now is refused: queued behind itself, it would only be
+ * claimed again, and refused, once the run ends.
  */
 export async function handleRun(body: string): Promise<{ code: number; location?: string; body?: string }> {
   const iid = positiveIid(new URLSearchParams(body).get('iid'));
   if (iid === null) return { code: 400, body: 'iid must be a positive ticket number' };
+  if (allRuns().some((r) => r.iid === iid && r.live)) return { code: 409, body: `#${iid} is running right now` };
   enqueue(iid, 'dashboard');
   return { code: 303, location: `/?queued=${iid}` };
 }

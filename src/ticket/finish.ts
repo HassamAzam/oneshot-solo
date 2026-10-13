@@ -11,6 +11,13 @@
  * The worktree is kept in every status (the branch is pushed; `npm run reap`
  * sweeps merged ones). The app server on the run's port is reaped in every
  * status — a resumed run starts its own again.
+ *
+ * The journal's terminal `status` is written LAST, after the label swap and
+ * the note. A terminal journal makes a later finish() a no-op, so writing it
+ * first would let a throw part-way leave the ticket on `Loop` with no note and
+ * run.ts's catch-all unable to put it in front of a human. What the run found
+ * (the MR, whether it merged, why it blocked) is recorded first, so the
+ * dashboard and the next claim see it even when a later call throws.
  */
 import { addIssueNote, editIssueLabels, updateMergeRequest, type GitlabResult, type MergeRequest } from '../lib/gitlab.js';
 import { DRY_RUN, mergeMode as mergeModeFn, projectConfig } from '../lib/config.js';
@@ -86,10 +93,11 @@ const TERMINAL = new Set(['done', 'blocked', 'aborted']);
 export async function finish(iid: number, runId: string, outcome: Outcome, deps: FinishDeps = REAL): Promise<void> {
   const L = projectConfig().labels;
   const j = readJournal(iid);
-  // Re-entered after the run already ended — run.ts's catch-all re-runs finish
-  // as blocked when the first finish threw part-way (after a merge, say). The
-  // first verdict stands: relabelling a merged ticket Needs Human, or posting a
-  // second note, would be wrong on GitLab and in the journal.
+  // Re-entered after the run already ended: the first verdict stands, since
+  // relabelling a finished ticket or posting a second note would be wrong on
+  // GitLab and in the journal. A finish that threw part-way never stops here —
+  // its status is written last — so run.ts's catch-all still puts that ticket
+  // in front of a human.
   if (j && TERMINAL.has(j.status)) {
     log.warn(`#${iid} finish called again on a ${j.status} run — leaving GitLab and the journal as they are`, { outcome: outcome.kind });
     return;
@@ -104,7 +112,7 @@ export async function finish(iid: number, runId: string, outcome: Outcome, deps:
   }
 
   if (outcome.kind === 'infra' || outcome.kind === 'blocked') {
-    updateJournal(iid, { status: 'blocked', blockedWhy: outcome.why, stoppedAt: Date.now() });
+    updateJournal(iid, { blockedWhy: outcome.why });
     const detail = outcome.kind === 'infra'
       ? `Run \`${runId}\`, ${dur(elapsed)}: it ended without a verdict — the machinery failed, not the work. `
         + `Check the machine, then swap \`${L.blocked}\` for \`${L.entry}\` or run \`npm start -- --ticket ${iid}\`.`
@@ -112,12 +120,14 @@ export async function finish(iid: number, runId: string, outcome: Outcome, deps:
     warnIfFailed(`#${iid} label swap`, await deps.editIssueLabels(iid, { remove: [L.entry, L.inReview], add: [L.blocked] }));
     warnIfFailed(`#${iid} stop note`, await deps.addIssueNote(iid,
       `Oneshot stopped: **${mdText(outcome.why)}**\n\n${detail}\n\n<!-- oneshot:stop:${runId} -->`));
+    updateJournal(iid, { status: 'blocked', stoppedAt: Date.now() });
     log.error(`■ #${iid} BLOCKED${outcome.kind === 'infra' ? ' (infra)' : ''} — ${outcome.why}`);
     return;
   }
 
   // done
   const { result } = outcome;
+  updateJournal(iid, { mrIid: outcome.mr.iid, mrUrl: outcome.mr.web_url });
   const { mr, problems } = await undraft(outcome.mr, outcome.problems, deps);
   const gate = mergeGate(result, mr, problems, deps.mergeMode());
   let merged = false;
@@ -130,7 +140,7 @@ export async function finish(iid: number, runId: string, outcome: Outcome, deps:
     merged = m.merged;
     why = m.why;
   }
-  updateJournal(iid, { status: 'done', mrIid: mr.iid, mrUrl: mr.web_url, merged, stoppedAt: Date.now() });
+  updateJournal(iid, { merged });
 
   const head = merged ? `Oneshot merged !${mr.iid}` : `Oneshot opened !${mr.iid} — not merged: ${mdText(why)}`;
   const body = [
@@ -146,6 +156,7 @@ export async function finish(iid: number, runId: string, outcome: Outcome, deps:
     ? { remove: [L.entry, L.blocked, L.inReview], add: [L.exit] }
     : { remove: [L.entry, L.blocked], add: [L.inReview] }));
   warnIfFailed(`#${iid} note`, await deps.addIssueNote(iid, body));
+  updateJournal(iid, { status: 'done', stoppedAt: Date.now() });
   if (merged) log.ok(`■ #${iid} merged — !${mr.iid}`);
   else log.warn(`■ #${iid} in review — !${mr.iid} (${why})`);
 }

@@ -53,3 +53,14 @@ test('a POST is refused from any origin but the dashboard itself', async () => {
   assert.equal(sameOrigin({ origin: 'null' }, 8787), false);                              // sandboxed frame, file://
   assert.equal(sameOrigin({ referer: 'https://evil.example/x' }, 8787), false);
 });
+test('POST /run refuses a ticket whose run is live right now', async () => {
+  const { handleRun } = await import('./serve.js');
+  mkdirSync(join(RUNS, '9'), { recursive: true });
+  writeFileSync(join(RUNS, '9', 'run.json'), JSON.stringify({ runId: 'r-9', iid: 9, project: 'erp', title: 'nine', url: 'u', createdAt: 90, status: 'running', pid: process.pid, phases: [] }));
+  assert.deepEqual(await handleRun('iid=9'), { code: 409, body: '#9 is running right now' });
+  const { queued } = await import('../src/lib/queue.js');
+  assert.ok(!queued().some((q) => q.iid === 9), 'a live ticket is not queued behind itself');
+  // The same ticket once its run has finished is queued as usual.
+  writeFileSync(join(RUNS, '9', 'run.json'), JSON.stringify({ runId: 'r-9', iid: 9, project: 'erp', title: 'nine', url: 'u', createdAt: 90, status: 'done', stoppedAt: 95, pid: process.pid, phases: [] }));
+  assert.deepEqual(await handleRun('iid=9'), { code: 303, location: '/?queued=9' });
+});

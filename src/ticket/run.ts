@@ -12,7 +12,7 @@
 import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
 import { PROJECT_TARGET, appPort, projectConfig, sessionModel } from '../lib/config.js';
-import { getIssue, issueUrl, resolvedProjectId } from '../lib/gitlab.js';
+import { getIssue, getMergeRequest, issueUrl, resolvedProjectId } from '../lib/gitlab.js';
 import {
   archiveRun, ensureRunDirs, pidAlive, readJournal, recordPhase, updateJournal, writeJournal, type RunJournal,
 } from '../lib/journal.js';
@@ -159,39 +159,58 @@ function oneLine(err: unknown): string {
   return (lines.find((l) => /^(fatal|error):/i.test(l)) ?? lines[0] ?? 'unknown error').slice(0, 300);
 }
 
+/** What GitLab says of a merge request now; 'unknown' when it could not be asked. */
+export type MrState = 'merged' | 'opened' | 'closed' | 'unknown';
+
 export interface LeaseDeps {
   leaseWorktree: typeof leaseWorktree;
   reapWorktree: typeof reapWorktree;
   deleteLocalBranch: typeof deleteLocalBranch;
   exists: (path: string) => boolean;
+  mrState: (mrIid: number) => Promise<MrState>;
 }
 
-const REAL_LEASE: LeaseDeps = { leaseWorktree, reapWorktree, deleteLocalBranch, exists: existsSync };
+async function mrState(mrIid: number): Promise<MrState> {
+  const res = await getMergeRequest(mrIid).catch(() => null);
+  const state = res?.ok ? res.data?.state : undefined;
+  return state === 'merged' || state === 'opened' || state === 'closed' ? state : 'unknown';
+}
+
+const REAL_LEASE: LeaseDeps = { leaseWorktree, reapWorktree, deleteLocalBranch, exists: existsSync, mrState };
+
+/** `<branch>-<the run id's first 6 after "r-">`: a name no earlier run of the ticket used. */
+function suffixed(branch: string, runId: string): string {
+  return `${branch}-${runId.replace(/^r-/, '').slice(0, 6)}`;
+}
 
 /**
  * The worktree and branch a claim runs in. The worktree outlives its run
  * (spec §5.4), and it holds the ticket's branch, so:
  *
- * - The previous run MERGED: its branch is history — the MR merged and GitLab
- *   removed the remote. The old worktree is reaped, the local branch deleted
- *   (else leaseWorktree would re-attach it), and a fresh lease is cut from
- *   base under the same name. When git will not delete the branch, the lease
- *   takes `<branch>-<run id stamp>` instead: a ticket that comes back must
- *   never continue on merged commits.
+ * - The previous run's MR MERGED — the journal says so, or GitLab does (a
+ *   person merged it in `merge.mode: manual`): its branch is history. The old
+ *   worktree is reaped, the local branch deleted (best effort), and a fresh
+ *   lease is cut from base under `<title's branch>-<run id stamp>` — always a
+ *   new name, because GitLab may not have removed the merged remote branch
+ *   (protected, or the removal failed) and a push onto it would be refused as
+ *   non-fast-forward. A ticket that comes back must never continue on merged
+ *   commits.
  * - A resumed run, or a ticket that came back while its worktree still exists,
  *   re-attaches through leaseWorktree under the recorded branch and worktree
  *   name, so it is re-seeded and its identity re-pinned like any lease.
  *   (`git worktree add` would refuse the branch while that worktree has it.)
  * - Otherwise a fresh lease from base on the title's branch.
  */
-export function leaseFor(
+export async function leaseFor(
   iid: number, runId: string, title: string, existing: RunJournal | null, resuming: boolean, deps: LeaseDeps = REAL_LEASE,
-): Lease {
+): Promise<Lease> {
   const titled = branchFor(projectConfig().branches.prefix, iid, title);
-  if (!resuming && existing?.status === 'done' && existing.merged) {
-    const merged = existing.branch ?? titled;
+  const wasMerged = !resuming && !!existing
+    && (existing.merged === true || (existing.mrIid ? (await deps.mrState(existing.mrIid)) === 'merged' : false));
+  if (existing && wasMerged) {
     if (existing.worktree) deps.reapWorktree(existing.worktree, existing.runId);
-    const branch = deps.deleteLocalBranch(merged) ? merged : `${merged}-${runId.replace(/^r-/, '').slice(0, 6)}`;
+    deps.deleteLocalBranch(existing.branch ?? titled);
+    const branch = suffixed(titled, runId);
     log.info(`#${iid} was merged by run ${existing.runId} — cutting a fresh branch ${branch} from base`);
     return deps.leaseWorktree(runId, branch, worktreeName(iid, runId));
   }
@@ -247,7 +266,7 @@ export async function runTicket(iid: number, opts: { signal?: AbortSignal; force
 
     let lease: Lease;
     try {
-      lease = leaseFor(iid, runId, ticket.title, existing, resuming);
+      lease = await leaseFor(iid, runId, ticket.title, existing, resuming);
     } catch (err) {
       await finish(iid, runId, { kind: 'blocked', why: `worktree: ${oneLine(err)}` });
       return readJournal(iid)?.status ?? 'blocked';
@@ -259,7 +278,8 @@ export async function runTicket(iid: number, opts: { signal?: AbortSignal; force
     // Compiles while the model plans; a failure here is a slower run, not a broken one.
     startRunApp({ iid, runId, worktree: lease.worktree, port });
 
-    // Asked once, for mr-gate and the GitLab server's allowlist; the path alone holds both when GitLab cannot answer.
+    // Asked once, for mr-gate and the GitLab server's one-entry allowlist. When GitLab cannot
+    // answer, mr-gate holds the MR writes to the path and the server runs without an allowlist.
     const projectId = (await resolvedProjectId()) ?? undefined;
     const out = await attemptLoop(
       { iid, runId, ticket, worktree: lease.worktree, branch, port, signal: opts.signal, resume: resuming ? lastSessionId(existing) : undefined, projectId },

@@ -196,13 +196,16 @@ export function sessionEnv(input: SessionInput): Record<string, string> {
  * MR note and upload_markdown stay), SERVER_DENIED_TOOLS_REGEX takes the rest
  * of DENIED_TOOLS, and the project allowlist with strict scope holds every
  * call to this project — the token itself reaches every project the operator
- * can. The path is always known; the numeric id joins it when the conductor
- * resolved one.
+ * can. The allowlist is the numeric id ALONE, and only when the conductor
+ * resolved one: 2.2.4's getEffectiveProjectId defaults a call that omits
+ * project_id only from a one-entry list, and with two entries (id and path)
+ * every such call failed "Multiple projects allowed". Never the path: an
+ * unresolved id leaves the server unscoped and mr-gate, which knows the path,
+ * holds the writes.
  */
 export function sessionMcpServers(iid: number, projectId?: number): Record<string, McpStdioServerConfig> {
   const token = resolveToken().token;
   if (!token) return {};
-  const path = gitlabRepo().project;
   return {
     gitlab: {
       type: 'stdio',
@@ -218,8 +221,7 @@ export function sessionMcpServers(iid: number, projectId?: number): Record<strin
         GITLAB_TOOLS: 'create_merge_request_note,upload_markdown',
         GITLAB_PERMISSION_MODE: 'modify',
         GITLAB_DENIED_TOOLS_REGEX: SERVER_DENIED_TOOLS_REGEX,
-        GITLAB_PROJECT_ID: projectId ? String(projectId) : path,
-        GITLAB_ALLOWED_PROJECT_IDS: [projectId ? String(projectId) : '', path].filter(Boolean).join(','),
+        ...(projectId ? { GITLAB_PROJECT_ID: String(projectId), GITLAB_ALLOWED_PROJECT_IDS: String(projectId) } : {}),
         ENABLE_STRICT_PROJECT_SCOPE: 'true',
       },
     },

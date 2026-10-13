@@ -772,6 +772,14 @@ expect_deny  "keychain read via a full path" secret-guard.cjs "$(bash_payload 'T
 expect_allow "grepping the source for the keychain service" secret-guard.cjs "$(bash_payload 'grep -rn oneshot-gitlab src/lib/token.ts')"
 
 echo
+echo "secret-guard (Grep at the harness root)"
+# A search rooted at ONESHOT_HOME, or above it, walks .env with everything else.
+expect_deny  "Grep rooted at ONESHOT_HOME"     secret-guard.cjs '{"tool_name":"Grep","tool_input":{"pattern":"GITLAB_TOKEN","path":"'"$ONESHOT_HOME"'"}}'
+expect_deny  "Grep rooted above ONESHOT_HOME"  secret-guard.cjs '{"tool_name":"Grep","tool_input":{"pattern":"GITLAB_TOKEN","path":"'"$(dirname "$ONESHOT_HOME")"'"}}'
+expect_allow "Grep inside the worktree"        secret-guard.cjs '{"tool_name":"Grep","tool_input":{"pattern":"GITLAB_TOKEN","path":"'"$ONESHOT_WORKTREE"'"}}'
+expect_allow "Grep with no path (cwd = worktree)" secret-guard.cjs '{"tool_name":"Grep","cwd":"'"$ONESHOT_WORKTREE"'","tool_input":{"pattern":"GITLAB_TOKEN"}}'
+
+echo
 echo "traps-brief"
 out="$(printf '{}' | "$NODE" "$ROOT/hooks/packs/erp/traps-brief.cjs" 2>/dev/null)"
 if printf '%s' "$out" | grep -q '"hookEventName":"SessionStart"'; then green "  PASS  traps-brief injects without a phase gate"; PASS=$((PASS+1)); else red "  FAIL  traps-brief did not inject"; FAIL=$((FAIL+1)); fi

@@ -140,6 +140,8 @@ Never set `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` or
 `CLAUDE_CODE_USE_*` in the conductor's shell: the session runs on your subscription, the
 session environment is an allowlist that strips them, and boot and doctor refuse them.
 
+The app bring-up gets the same allowlisted environment as the session plus `app.cjs`'s own `.env` load; shell-only variables (for example `PG*`) do not reach Django — put them in `.env`.
+
 `config/project.json` is everything about the project the URL does not say:
 
 | field | |
