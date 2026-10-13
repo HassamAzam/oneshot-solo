@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { sessionStats, mergeUsage, runSummary } from './telemetry.js';
+import { sessionStats, mergeUsage, runSummary, attemptTokens } from './telemetry.js';
 
 const line = (o: unknown) => JSON.stringify(o);
 const assistant = (id: string, ts: number, usage: Record<string, number>, content: unknown[], parent: string | null = null) =>
@@ -76,4 +76,14 @@ test('runSummary derives wall clock, live flag and totals from the journal', () 
   assert.equal(done.durationMs, 8000);
   assert.equal(done.live, false);
   assert.equal(done.merged, true);
+});
+
+test('attemptTokens falls back to oneshot\'s legacy weighted count when modelUsage is absent', () => {
+  assert.equal(attemptTokens({ weighted: 70303 }), 70303);
+  assert.equal(attemptTokens({ modelUsage: { m: { inputTokens: 5, outputTokens: 5 } }, weighted: 70303 }), 10);
+  assert.equal(attemptTokens({}), 0);
+  const dir = mkdtempSync(join(tmpdir(), 'solo-legacy-'));
+  const j = { runId: 'r-9', iid: 9, project: 'erp', title: 'legacy', url: 'u', createdAt: 1000, status: 'done' as const, stoppedAt: 5000,
+    phases: [{ phase: 'ticket' as const, lap: 0, status: 'ok' as const, startedAt: 1000, endedAt: 4000, weighted: 461000 }] };
+  assert.equal(runSummary(j, dir).tokens, 461000);
 });

@@ -37,7 +37,7 @@ import { RUNS_ARCHIVE, envOr, runDir } from './config.js';
 import { readJournalFrom, type PhaseRecord, type RunJournal } from './journal.js';
 import { log } from './log.js';
 import {
-  checkpointOf, fmtDuration, fmtTokens, modelUsageTokens, runSummary, type RunSummary,
+  attemptTokens, checkpointOf, fmtDuration, fmtTokens, runSummary, type RunSummary,
 } from './telemetry.js';
 
 /**
@@ -480,7 +480,7 @@ function phaseFrom(rec: PhaseRecord, dir: string, file: string, live: boolean): 
     durationMs: Math.max(0, end - rec.startedAt),
     model: rec.model ?? '',
     turns: rec.turns ?? 0,
-    tokens: modelUsageTokens(rec.modelUsage),
+    tokens: attemptTokens(rec),
     costUsd: rec.costUsd ?? 0,
     resumed: rec.resumed === true,
     checkpoints: checkpointsIn(parsed),

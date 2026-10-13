@@ -45,6 +45,8 @@ export interface PhaseRecord {
   costUsd?: number;
   /** Per-model tokens including subagents — the only complete usage figure. */
   modelUsage?: Record<string, unknown>;
+  /** oneshot's pre-Solo journals carried one weighted token count per phase; read, never written. */
+  weighted?: number;
   /** True when the attempt resumed the previous attempt's session. */
   resumed?: boolean;
   resultSubtype?: string;

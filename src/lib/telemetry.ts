@@ -58,6 +58,16 @@ export function modelUsageTokens(modelUsage: Record<string, unknown> | undefined
 }
 
 /**
+ * Tokens for one attempt record: `modelUsage` when Solo wrote it, else the
+ * single `weighted` figure oneshot's journals carried, so a run copied in from
+ * the old harness still reads a number instead of 0.
+ */
+export function attemptTokens(rec: { modelUsage?: Record<string, unknown>; weighted?: number }): number {
+  const fromUsage = modelUsageTokens(rec.modelUsage);
+  return fromUsage > 0 ? fromUsage : Math.max(0, Number(rec.weighted ?? 0) || 0);
+}
+
+/**
  * One transcript tee, summarised.
  *
  * The FIRST result frame settles turns, duration and cost: a session can emit a
@@ -137,7 +147,7 @@ export function runSummary(j: RunJournal, dir: string, archived: string | null =
     durationMs: Math.max(0, end - j.createdAt),
     attempts: phases.length,
     turns: phases.reduce((n, p) => n + (p.turns ?? 0), 0),
-    tokens: phases.reduce((n, p) => n + modelUsageTokens(p.modelUsage), 0),
+    tokens: phases.reduce((n, p) => n + attemptTokens(p), 0),
     costUsd: phases.reduce((n, p) => n + (p.costUsd ?? 0), 0),
     mrUrl: j.mrUrl ?? null, merged: j.merged === true, live, archived,
   };
