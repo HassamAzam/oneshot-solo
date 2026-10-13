@@ -25,9 +25,8 @@ import {
 import { dirname, join } from 'node:path';
 import { ensureClaudeDir } from './claudedir.js';
 import {
-  CONTEXT_REPO, WORK_REPO, WT_ROOT, envOr, expandPath, portPool, projectConfig, seedFrom,
+  CONTEXT_REPO, WORK_REPO, WT_ROOT, envOr, projectConfig, seedCopies, seedFrom, seedLinks,
 } from './config.js';
-import { db } from './db.js';
 import { retryRefLockRace } from './gitfetch.js';
 import { log } from './log.js';
 
@@ -52,49 +51,10 @@ function git(args: string[], cwd = WORK_REPO): string {
 export interface Lease {
   worktree: string;
   branch: string;
-  /** Present only when the caller asked for one — see leaseWorktree's options. */
-  port?: number;
-  baseSha: string;
+  /** The base BRANCH the worktree was cut from (project.json branches.base). */
+  base: string;
+  runId: string;
 }
-
-/**
- * Reclaim what is dead and take the first port still free — as ONE statement's
- * worth of exclusivity.
- *
- * The reclaim is not housekeeping, it is the pool's only repair path. A lease is
- * released in teardown, so a conductor that died mid-run leaves a row owning a
- * port forever, and the pool is three entries wide. Ownership is decided by the
- * runs table, which boot-time reconciliation has already truthed: a lease whose
- * run is no longer claimed or running cannot be in use by anyone.
- *
- * IMMEDIATE, and not merely a transaction. Read-then-write is exactly the shape
- * SQLite refuses to arbitrate on a deferred handle — the second writer takes its
- * snapshot on the read, discovers the world moved under it on the write, and
- * fails instantly with SQLITE_BUSY_SNAPSHOT without ever consulting
- * busy_timeout. Taking the write lock up front turns that into a wait the loser
- * survives, which is what makes the answer below trustworthy: with two
- * conductors leasing at once, both used to see the same port free and one died
- * on the primary key while two ports sat unused.
- *
- * The body is deliberately tiny for the same reason it is exclusive.
- * better-sqlite3 is synchronous, so everything inside this transaction is time
- * the event loop is not running — no tick, no abort, no Slack card. Two
- * statements and a set membership test is the whole budget.
- */
-const takeFreePort = db.transaction((runId: string, pool: number[], unavailable: Set<number>) => {
-  const reaped = db.prepare(`DELETE FROM port_leases WHERE run_id NOT IN
-    (SELECT run_id FROM runs WHERE status IN ('claimed','running'))`).run().changes;
-  const taken = new Set(
-    (db.prepare('SELECT port FROM port_leases').all() as Array<{ port: number }>).map((r) => r.port),
-  );
-  for (const port of pool) {
-    if (taken.has(port) || unavailable.has(port)) continue;
-    db.prepare('INSERT INTO port_leases (port, run_id, leased_at) VALUES (?, ?, ?)')
-      .run(port, runId, Date.now());
-    return { port, reaped };
-  }
-  return { port: null as number | null, reaped };
-});
 
 /**
  * PIDs listening on a TCP port — empty when it is free.
@@ -117,16 +77,14 @@ function portListeners(port: number): number[] {
 }
 
 /**
- * Kill whatever is listening on a run's leased port.
+ * Kill whatever is listening on a run's app port.
  *
- * Called from a run's terminal path: `releasePort` only drops the SQLite row,
- * so without this the dev server a phase started outlives the run, and the port
- * pool fills with orphans from crashed and blocked runs — which is how a later
- * verify came to drive a stale server and report on the wrong code. Best-effort
- * and never throws: a port with nothing on it is the normal case.
+ * Called from a run's terminal path: without it the dev server the run started
+ * outlives the run, and the next ticket's session drives a stale server and
+ * reports on the wrong code. Best-effort and never throws: a port with nothing
+ * on it is the normal case.
  *
- * Only the leased port is reaped, never the shared webpack port — a concurrent
- * run may be serving its own frontend there.
+ * Only the run's own port is reaped, never the shared webpack port.
  */
 export function reapPortServer(port: number | null | undefined): number {
   if (!port) return 0;
@@ -136,42 +94,6 @@ export function reapPortServer(port: number | null | undefined): number {
   }
   if (killed) log.info(`reaped ${killed} process(es) on port ${port}`);
   return killed;
-}
-
-/**
- * Lease a port for this run, or say plainly that there is none.
- *
- * Ports are the real concurrency limit for phases that run a dev server. Leased
- * through SQLite rather than by probing, because a port that is free *right now*
- * can be taken by the next phase two seconds later.
- *
- * null rather than a throw when the pool is exhausted: an empty pool is a
- * capacity answer the caller can act on, and dressing it as an exception put it
- * in the same catch as a genuinely broken database.
- */
-export function leasePortFor(runId: string): number | null {
-  db.exec(`CREATE TABLE IF NOT EXISTS port_leases (
-    port INTEGER PRIMARY KEY, run_id TEXT NOT NULL, leased_at INTEGER NOT NULL)`);
-  const pool = portPool();
-  // A port that is free in the lease table but has a process listening on it is
-  // either an orphan from a run that never reaped or a foreign dev server
-  // sharing these ports. Leasing it anyway is exactly how a verify phase ends up
-  // driving somebody else's server and reporting on the wrong code. Probe here —
-  // outside the SQLite transaction, which must stay synchronous and tiny — and
-  // never hand out a port something is already answering on.
-  const occupied = new Set(pool.filter((p) => portListeners(p).length > 0));
-  const { port, reaped } = takeFreePort.immediate(runId, pool, occupied);
-  if (reaped) log.info(`reclaimed ${reaped} port lease(s) from finished runs`);
-  if (occupied.size) {
-    log.warn(`skipped occupied port(s) ${[...occupied].join(', ')} — a process is already listening there`);
-  }
-  return port;
-}
-
-export function releasePort(runId: string): void {
-  try {
-    db.prepare('DELETE FROM port_leases WHERE run_id = ?').run(runId);
-  } catch { /* table may not exist yet */ }
 }
 
 /**
@@ -224,17 +146,20 @@ export function seedWorktree(worktree: string): void {
   detachTrackedClaude(worktree);
   excluded.push(...ensureClaudeDir(worktree));
 
-  const from = seedFrom();
+  // The work repo is itself an installed clone, so it is the seed unless
+  // ONESHOT_SEED_FROM names another — the same rule projectSessionEnv() hands
+  // the session's app.cjs, so both seed from one place.
+  const from = seedFrom() || WORK_REPO;
   if (!from || !existsSync(from)) {
     log.warn('no seed repo — the worktree cannot run the app without npm ci / venv setup', {
-      fix: 'set ONESHOT_SEED_FROM to an already-installed clone',
+      fix: 'set WORK_REPO (or ONESHOT_SEED_FROM) to an already-installed clone',
     });
     addExcludes(worktree, excluded);
     return;
   }
 
-  const links = envOr('ONESHOT_SEED_LINKS', '').split(',').map((s) => s.trim()).filter(Boolean);
-  const copies = envOr('ONESHOT_SEED_COPIES', '').split(',').map((s) => s.trim()).filter(Boolean);
+  const links = seedLinks();
+  const copies = seedCopies();
 
   /**
    * A missing seed SOURCE is announced, not swallowed.
@@ -344,29 +269,6 @@ function addExcludes(worktree: string, paths: string[]): void {
 }
 
 /**
- * Where this branch left the base — the diff base every later phase reads
- * against.
- *
- * merge-base rather than the tip of origin/<base>, and computed WITHOUT a
- * fetch. A run lives for hours and the base branch moves under it; taking the
- * tip means the review, the evidence pack and the MR each describe a different
- * diff from the one implement wrote, and a resumed run's diff silently grows to
- * include whatever landed on dev while it was down. The merge-base is fixed by
- * the branch's own history, so it answers the same thing at every phase and on
- * every resumption.
- */
-function forkPoint(worktree: string, base: string): string {
-  try {
-    return git(['merge-base', 'HEAD', `origin/${base}`], worktree);
-  } catch (err) {
-    log.warn(`no merge-base with origin/${base} — diffing against HEAD`, {
-      error: (err as Error).message,
-    });
-    return git(['rev-parse', 'HEAD'], worktree);
-  }
-}
-
-/**
  * Give this worktree a committer identity WITHOUT touching the shared config.
  *
  * `git -C <worktree> config user.name` does not write a per-worktree setting —
@@ -414,14 +316,9 @@ function pinIdentity(worktree: string): void {
  * only on creation — re-attaching must not move origin/<base> under a run that
  * is already mid-flight.
  *
- * A port is leased only when `withPort` is set. Leasing one with the worktree
- * held a scarce, pool-limited resource from the first worktree phase through
- * every phase that has no use for it; the runner asks for one when it first
- * reaches a phase that actually serves the app.
+ * No port: Solo runs one ticket at a time on the fixed ONESHOT_PORT.
  */
-export function leaseWorktree(
-  runId: string, branch: string, name: string, opts: { withPort?: boolean } = {},
-): Lease {
+export function leaseWorktree(runId: string, branch: string, name: string): Lease {
   const cfg = projectConfig();
   const base = cfg.branches.base;
   mkdirSync(WT_ROOT, { recursive: true });
@@ -452,22 +349,15 @@ export function leaseWorktree(
   seedWorktree(worktree);
   pinIdentity(worktree);
 
-  const lease: Lease = { worktree, branch, baseSha: forkPoint(worktree, base) };
-  if (opts.withPort) {
-    const port = leasePortFor(runId);
-    if (port === null) log.warn('no free port in the pool — the worktree is leased without one');
-    else lease.port = port;
-  }
-  return lease;
+  return { worktree, branch, base, runId };
 }
 
 /** Remove the worktree. The BRANCH is deliberately left alone — it is pushed work. */
 export function reapWorktree(worktree: string, runId: string): void {
-  releasePort(runId);
   if (!existsSync(worktree)) return;
   try {
     git(['worktree', 'remove', '--force', worktree]);
-    log.ok(`reaped worktree ${worktree}`);
+    log.ok(`reaped worktree ${worktree}`, { runId });
   } catch (err) {
     log.warn('worktree remove failed — leaving it on disk', { error: (err as Error).message });
   }
@@ -475,114 +365,4 @@ export function reapWorktree(worktree: string, runId: string): void {
 
 export function contextRepoPresent(): boolean {
   return existsSync(CONTEXT_REPO);
-}
-
-// ------------------------------------------------------- re-running a phase
-//
-// The three below serve scripts that re-run a finished phase to measure a
-// harness change. They are separate from leaseWorktree() rather than options
-// on it because a lease is bookkeeping a run owns — a port, a branch, a row
-// reaped on completion — and a measurement owns none of that.
-
-/**
- * A detached worktree at a fixed commit.
- *
- * Detached rather than on a branch: this exists to re-read code, and a
- * detached HEAD has nothing to push. The original run's own worktree is not
- * reused because later phases may have committed to it, which would show the
- * re-run the answer.
- */
-export function replayWorktree(name: string, sha: string): string {
-  mkdirSync(WT_ROOT, { recursive: true });
-  const worktree = join(WT_ROOT, name);
-  if (!existsSync(worktree)) git(['worktree', 'add', '--detach', worktree, sha]);
-  seedWorktree(worktree);
-  return worktree;
-}
-
-/**
- * The commit a run's branch left the base at — where its phases started reading.
- *
- * Refuses, rather than answering, once the base already contains the branch.
- * `merge-base` returns the best common ancestor, so for a branch that has
- * landed that is the branch's own TIP: the replay would then build its worktree
- * on the finished implementation and re-plan a change that is already sitting
- * in front of it. Runs that finished are exactly the population a replay is
- * for, non-squash merges leave the branch resolvable afterwards, and nothing
- * downstream can tell a poisoned fork point from a good one — so this fails
- * closed and names the way out.
- */
-export function runForkPoint(branch: string, cwd = WORK_REPO): string {
-  const base = `origin/${projectConfig().branches.base}`;
-  try {
-    git(['merge-base', '--is-ancestor', branch, base], cwd);
-  } catch {
-    // Not an ancestor: the ordinary case, and merge-base is the real fork point.
-    return git(['merge-base', branch, base], cwd);
-  }
-  throw new Error(
-    `${branch} is contained in ${base} — merge-base would return its tip, not its fork point, `
-    + 'and the replay would read the implementation it is meant to plan. Pass --base <sha>.',
-  );
-}
-
-/**
- * Commits that reference this ticket and are NOT in the replay's base — the
- * answer key, if the phase goes looking for it.
- *
- * `replayWorktree` uses `git worktree add`, which shares the object store and
- * every ref of the work repo. So a detached checkout at a pre-fix base is a
- * blind WORKING TREE inside a repository that still holds the merged fix:
- * `git log --all`, `git show <sha>` and `git log --grep=#<iid>` all reach it.
- *
- * `runForkPoint` fails closed for a landed branch and tells the caller to pass
- * `--base <sha>`. That escape hatch fixes the checkout and does nothing about
- * reachability, which is how a measured replay stopped being blind without
- * anyone noticing. This does not prevent that — it makes the run declare it,
- * so the artifact carries its own caveat instead of somebody's memory.
- *
- * Empty only when no commit naming #<iid> is reachable outside the base, which
- * in practice means the source run never committed. A run that reached
- * implement keeps its branch, and its commits carry `(#<iid>)`: those are an
- * answer key even though they never landed, so the default path (no --base,
- * base = runForkPoint) is flagged just as a landed fix is. Of 35 local runs
- * with a research.json, 20 came back non-empty at their fork point and 18 of
- * those were on branches that never landed.
- *
- * Empty is not proof the run was blind. This greps commit messages, so a fix
- * whose messages never name the ticket — a squash merge titled after the
- * change — is not found.
- *
- * Throws when git cannot list the commits, rather than answering []: an empty
- * list is the one result a caller reads as reassurance, so a check that did
- * not run must not be able to produce it. The caller decides what "not
- * checked" looks like in its artifact.
- */
-export function answerKeyCommits(iid: number, base: string, cwd = WORK_REPO): string[] {
-  // `([^0-9]|$)` rather than `\b`: git's ERE has no word-boundary escape, and
-  // a bare `#18` would otherwise match #189 and report every low-numbered
-  // ticket as contaminated until the warning stopped meaning anything.
-  //
-  // `--not <base>` drops history the phase is entitled to read, in the same
-  // walk. It replaced a `merge-base --is-ancestor` spawn per candidate, which
-  // gave the same set (32 of 32 on ERP #8783) but read a failed merge-base as
-  // "not in the base" and over-reported.
-  //
-  // No catch. No matching commit exits 0 and gives [] on its own; git fails
-  // only when it cannot walk the repo or resolve the base, and one dangling ref
-  // anywhere in the work repo is enough (`fatal: bad object`, exit 128). The
-  // catch this replaced swallowed that as [], which the caller recorded as the
-  // reassuring reading for a check that never ran.
-  return git(['log', '--all', '--not', base, '--format=%H %s', '-E', `--grep=#${iid}([^0-9]|$)`], cwd)
-    .split('\n').map((l) => l.trim()).filter(Boolean);
-}
-
-/** Counterpart to replayWorktree. No branch to preserve, and no port to release. */
-export function removeReplayWorktree(worktree: string): void {
-  if (!existsSync(worktree)) return;
-  try {
-    git(['worktree', 'remove', '--force', worktree]);
-  } catch (err) {
-    log.warn('replay worktree remove failed — leaving it on disk', { error: (err as Error).message });
-  }
 }
